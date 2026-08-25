@@ -34,9 +34,11 @@ subprocess into a pixi environment, so reading the notebook costs nothing.
 
 ## Two facts that will bite before anything else does
 
-**RF-DETR gives 17 joints and ANNY's `coco.pth` gives 23.** The extra six are foot
-points. Comparing the two arrays directly compares different things, so the subset is
-taken explicitly and named, not sliced silently.
+**The detector is the fullbody one, so the vocabulary is ANNY's 104 bone labels.** An
+earlier version of this notebook subset every target to COCO-17 and then reported that the
+referee could not run. It could not run because 87 of the 104 points were being thrown
+away. Nothing here asserts a length now: names arrive with the targets, and a name the
+forward does not carry raises rather than shortening the array.
 
 **`render_corpus.py` requires the 19,158-vertex makehuman topology** with
 `remove_unattached_vertices=False`. The 13,718-vertex body submodel that `anny_rig.py`
@@ -54,20 +56,6 @@ sys.path.insert(0, str(HARNESS))
 sys.path.insert(0, str(CONSENSUS))
 
 from weft_loop import run, pixi_run, plot, household, PreconditionFailed
-
-COCO17 = ["nose", "left_eye", "right_eye", "left_ear", "right_ear",
-          "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-          "left_wrist", "right_wrist", "left_hip", "right_hip",
-          "left_knee", "right_knee", "left_ankle", "right_ankle"]
-
-
-def to_17(names, array):
-    """The explicit subset. A missing name is an error, not a shorter array."""
-    index = {n: i for i, n in enumerate(names)}
-    missing = [n for n in COCO17 if n not in index]
-    if missing:
-        raise KeyError(f"the render asset is missing {missing}")
-    return array[[index[n] for n in COCO17]]
 ```
 
 ## Inputs
@@ -79,14 +67,6 @@ WORK.mkdir(exist_ok=True)
 ```
 
 `hv_0.png` is an ANNY render standing in for a photograph so that the path resolves. It is
-not a photograph, and a render scored against itself measures the renderer rather than the
-fit, so point `PHOTO` at a real image before reading anything into the number.
-
-`hv_0.png` is an ANNY render standing in for a photograph so that the path resolves. It is
-not a photograph, and a render scored against itself measures the renderer rather than the
-fit, so point `PHOTO` at a real image before reading anything into the number.
-
-`hv_0.png` is an ANNY render standing in for a photograph, so that the path resolves. It is
 not a photograph, and a render scored against itself measures the renderer rather than the
 fit, so point `PHOTO` at a real image before reading anything into the number.
 
@@ -151,30 +131,35 @@ wrong, and the correction is worth more than the claim was.**
 strong-Wolfe line search for the rotations. What was missing was only the front end: that
 file takes 3D world positions and a detector gives 2D pixels.
 
-`priv/python/loop1_fit.py` is that front end, built on the same two ideas. The forward is
-already differentiable -- `KeypointsRegressor` is a per-vertex convex blend from vertices to
-the named keypoints, and everything from pose parameters to those keypoints is torch -- so
-composing a weak-perspective camera onto the end makes the loss a reprojection distance and
-no inverse model is needed.
+`priv/python/loop1_fit.py` is that front end, built on the same two ideas. The forward for a
+fullbody target is ANNY's own joints, `bone_poses[0, :, :3, 3]` indexed by bone label, which
+is what `fit_joints_to_anny.py` uses; the 23-point `KeypointsRegressor` blend stays available
+for a target expressed in those 23. Both are differentiable end to end, so composing a
+weak-perspective camera makes the loss a reprojection distance and no inverse model is
+needed.
 
 ```python
 import numpy as np
 
-from loop1_fit import build_model, fit_2d, residuals_by_region, detect_keypoints
-from anny.keypoints import KeypointsRegressor
+from loop1_fit import build_model, bone_names, fit_2d, residuals_by_region, detect_keypoints
 
 model = build_model()
-regressor = KeypointsRegressor.coco(model)
+names = bone_names(model)          # the fullbody 104, ANNY's own labels
 target2d, confidence = detect_keypoints(PHOTO)
-fit = fit_2d(model, regressor, target2d, confidence)
+fit = fit_2d(model, target2d, names, confidence)
 print(f"median {float(np.median(fit['residual_px'])):.2f} px of {fit['stature_px']:.0f} px stature")
 ```
 
 **Measured, by a known-answer round trip rather than by inspection.** Pose the rig, project
-its own keypoints through a known camera, throw the pose away and fit it back:
-`priv/python/test_loop1_fit.py` recovers a median of 1.56 px on a 590 px stature, which is
-0.263% of stature, or 4.5 mm on a 1.7 m body -- about one pencil. Shuffled targets reach
-111.8 px, so the round trip is measuring the solve rather than the rest pose.
+its own 104 joints through a known camera, throw the pose away and fit it back:
+`priv/python/test_loop1_fit.py` recovers a median of 1.19 px on a 591 px stature, which is
+0.202% of stature, or 3.4 mm on a 1.7 m body -- about two stacked pennies. Shuffled targets
+reach 233 px, so the round trip is measuring the solve rather than the rest pose.
+
+**The fullbody vocabulary fills all five referee regions**, which is what a 17-point set
+never does: 31 body points, 30 feet, 20 per hand and 3 face. An earlier version of this
+notebook subset every target to COCO-17 and then reported that the referee could not run.
+It could not run because 87 of the 104 points were being thrown away.
 
 **The blocker moved, and it is now smaller.** Nothing here carries `rfdetr`: rf-detr-mcp
 documents a local virtual environment that is not in the checkout, and no pixi environment
@@ -183,7 +168,7 @@ points from anywhere -- a projection of an authored pose, a hand annotation, ano
 detector -- go straight into `fit_2d`.
 
 ```python
-fit_residuals = residuals_by_region(fit["residual_px"])
+fit_residuals = residuals_by_region(fit["names"], fit["residual_px"])
 stature = fit["stature_px"]
 ```
 

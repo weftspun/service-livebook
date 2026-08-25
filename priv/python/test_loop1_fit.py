@@ -1,16 +1,16 @@
-"""A known-answer test for the 2D fit, plus the controls that make it mean something.
+"""A known-answer test for the fullbody 2D fit, plus the controls that make it mean something.
 
-THE POSITIVE CONTROL IS A ROUND TRIP. Pose the rig, project its own COCO-17 keypoints
-through a known weak-perspective camera, throw the pose away, and fit it back from the 17
-pixels. The answer is known by construction, so the residual is a measurement rather than a
-number: it says how well the solver recovers a pose that is exactly representable.
+THE POSITIVE CONTROL IS A ROUND TRIP. Pose the rig, project its own 104 joints through a
+known weak-perspective camera, throw the pose away, and fit it back from the pixels. The
+answer is known by construction, so the residual is a measurement rather than a number: it
+says how well the solver recovers a pose that is exactly representable.
 
 THE NEGATIVE CONTROLS ARE WHAT STOP THAT BEING DECORATION. A fit to shuffled targets must
-not reach the same residual, or the round trip is measuring nothing but the rest pose. A
-target of the wrong shape, and one with no confidence anywhere, must raise rather than
-return something.
+not reach the same residual, or the round trip is measuring the rest pose. A name the
+forward does not carry, a target of the wrong shape, and a target with no confidence
+anywhere must all raise rather than return something.
 
-Runs on CPU in float64. No card, no weights beyond the `coco.pth` that ships with anny.
+Runs on CPU in float64. No card, and no weights beyond what anny ships.
 
     pixi run -e anny python priv/python/test_loop1_fit.py
 """
@@ -25,7 +25,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from loop1_fit import COCO17, build_model, fit_2d, keypoint_names, residuals_by_region, subset_17
+from loop1_fit import bone_names, build_model, fit_2d, region_of, residuals_by_region, subset
 
 FAILS: list[str] = []
 ITERS = 60
@@ -35,7 +35,7 @@ def expect_raise(label, fn, exc=(ValueError, KeyError)):
     try:
         fn()
     except exc as error:
-        print(f"  ok  {label}: rejected ({str(error)[:60]})")
+        print(f"  ok  {label}: rejected ({str(error)[:58]})")
         return
     except Exception as error:  # noqa: BLE001
         FAILS.append(label)
@@ -55,45 +55,39 @@ def household(mm):
 
 def main() -> int:
     torch.manual_seed(0)
-    model = build_model()
-
-    from anny.keypoints import KeypointsRegressor
     import roma
 
-    regressor = KeypointsRegressor.coco(model)
-    names = keypoint_names(regressor)
-    idx = subset_17(names)
+    model = build_model()
+    names = bone_names(model)
     n = model.bone_count
+    print(f"fullbody vocabulary: {len(names)} bone labels")
 
-    # A pose the rig can hold: small rotations on every bone, so the answer exists exactly.
     truth = 0.08 * torch.randn(n, 3, dtype=torch.float64)
     pose = torch.eye(4, dtype=torch.float64)[None, None].repeat(1, n, 1, 1).clone()
     pose[0, :, :3, :3] = roma.rotvec_to_rotmat(truth)
     with torch.no_grad():
         out = model(pose_parameters=pose)
-        kp3d = regressor(out)[0].to(torch.float64)[idx]
+        joints = out["bone_poses"][0, :, :3, 3].to(torch.float64)
         verts = out["vertices"][0].to(torch.float64)
         true_stature = float(verts[:, 1].max() - verts[:, 1].min())
 
     scale, translation = 900.0, torch.tensor([512.0, 384.0], dtype=torch.float64)
-    target = kp3d[:, :2] * scale + translation
+    target = joints[:, :2] * scale + translation
     target_stature = true_stature * scale
 
     print("known-answer round trip: fit the projection of a pose the rig can hold")
     started = time.monotonic()
-    result = fit_2d(model, regressor, target, iters=ITERS)
+    result = fit_2d(model, target, names, iters=ITERS)
     seconds = time.monotonic() - started
 
     median = float(np.median(result["residual_px"].numpy()))
     worst = float(result["residual_px"].max())
     fraction = median / target_stature
-    # 1.7 m of stature is the referee's own reference body, so the pixel residual is
-    # reported as the millimetres it would be on one.
     mm = fraction * 1700.0
     print(f"  median {median:.3f} px, worst {worst:.3f} px, {100 * fraction:.3f}% of stature")
     print(f"  on a 1.7 m body that is {mm:.2f} mm, {household(mm)}")
     print(f"  stature recovered {result['stature_px']:.1f} px against {target_stature:.1f} px")
-    print(f"  {seconds:.1f} s on CPU, {ITERS} LBFGS iterations")
+    print(f"  {seconds:.1f} s on CPU, {ITERS} LBFGS iterations, {len(names)} points")
 
     if fraction >= 0.02:
         FAILS.append("round trip")
@@ -103,8 +97,8 @@ def main() -> int:
 
     print("negative controls")
 
-    shuffled = target[torch.randperm(17, generator=torch.Generator().manual_seed(7))]
-    scrambled = fit_2d(model, regressor, shuffled, iters=ITERS)
+    shuffled = target[torch.randperm(len(names), generator=torch.Generator().manual_seed(7))]
+    scrambled = fit_2d(model, shuffled, names, iters=ITERS)
     scrambled_median = float(np.median(scrambled["residual_px"].numpy()))
     if scrambled_median <= median * 5:
         FAILS.append("shuffled targets")
@@ -113,15 +107,23 @@ def main() -> int:
         print(f"  ok  shuffled targets do not fit: {scrambled_median:.3f} px against {median:.3f} px")
 
     expect_raise("a target of the wrong shape",
-                 lambda: fit_2d(model, regressor, target[:10], iters=2))
+                 lambda: fit_2d(model, target[:, :1], names, iters=2))
+    expect_raise("names that do not match the target rows",
+                 lambda: fit_2d(model, target, names[:10], iters=2))
     expect_raise("a target with no confidence anywhere",
-                 lambda: fit_2d(model, regressor, target, confidence=np.zeros(17), iters=2))
-    expect_raise("a keypoint asset missing a COCO name",
-                 lambda: subset_17([n for n in names if n != "nose"]))
+                 lambda: fit_2d(model, target, names, confidence=np.zeros(len(names)), iters=2))
+    expect_raise("a name the forward does not carry",
+                 lambda: subset(names, ["no_such_joint"]))
 
-    regions = residuals_by_region(result["residual_px"])
-    print(f"regions filled: {sorted(regions)} -- face and hands stay absent, so the referee "
-          f"answers NOT_RUN")
+    regions = residuals_by_region(names, result["residual_px"])
+    counts = {r: len(v) for r, v in sorted(regions.items())}
+    print(f"regions filled by the fullbody vocabulary: {counts}")
+    for wanted in ("body", "feet", "face", "left_hand", "right_hand"):
+        if wanted not in regions:
+            FAILS.append(f"region {wanted}")
+            print(f"  BAD the fullbody vocabulary filled no {wanted}, so the referee cannot run")
+    if all(w in regions for w in ("body", "feet", "face", "left_hand", "right_hand")):
+        print("  ok  all five referee regions are filled, which a 17-point set never does")
 
     print(f"\n{len(FAILS)} failed")
     return 1 if FAILS else 0
