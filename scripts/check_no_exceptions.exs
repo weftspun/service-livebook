@@ -22,9 +22,18 @@
 # controls below say what would have to change with it.
 #
 # WHY IT PARSES RATHER THAN GREPS. `grep rescue` finds the word in this comment, in a
-# docstring, and in a string literal, and misses nothing it should find -- so it is the
-# convenient proxy rather than the quantity. This reads the AST, and one of the controls is
-# a file whose only `rescue` is inside a comment and a string, which must PASS.
+# docstring, and in a string literal -- the convenient proxy rather than the quantity. This
+# reads the AST, and one of the controls is a file whose only `rescue` is inside a comment
+# and a string, which must PASS.
+#
+# PARSING GOES THROUGH SOURCEROR. `Code.string_to_quoted/2` also parses, and the first
+# version used it; what Sourceror adds is the range of the construct -- start and end, line
+# and column -- so a violation is reported at the `rescue` rather than at the `def` that
+# encloses it, and so this gate can be turned into a fixer without being rewritten, because
+# Sourceror patches source back out without reformatting the file around it.
+#
+# It is a dependency where there was none. `mix deps.get` now has to run before this gate
+# does, which is a line in the workflow and a reason the hook is not standalone any more.
 #
 # WHAT IS NOT COVERED, named rather than omitted. This gate reads `lib/` and `test/` in this
 # project only. A sweep of the other Elixir checked out beside it finds `try` or `rescue` in
@@ -33,8 +42,8 @@
 # maintains them, and pretending this gate covers them would be worse than saying it does
 # not.
 #
-#     elixir scripts/check_no_exceptions.exs [path ...]
-#     elixir scripts/check_no_exceptions.exs --self-test
+#     mix run --no-start scripts/check_no_exceptions.exs [path ...]
+#     mix run --no-start scripts/check_no_exceptions.exs --self-test
 #
 # Exit code is non-zero on any violation, and on any control that fails to fail.
 
@@ -59,46 +68,72 @@ defmodule CheckNoExceptions do
   # is neither.
   @clause_keys [:rescue, :catch, :after]
 
-  @doc "Every violation in one source, as {line, construct}."
+  @doc "Every violation in one source, as {line, column, construct}."
   def scan(source, name \\ "nofile") do
-    case Code.string_to_quoted(source, file: name, columns: true) do
+    case Sourceror.parse_string(source) do
       {:ok, ast} ->
         {_ast, found} = Macro.prewalk(ast, [], &visit/2)
         {:ok, found |> Enum.uniq() |> Enum.sort()}
 
-      {:error, {meta, message, token}} ->
-        line = if is_list(meta), do: Keyword.get(meta, :line, 0), else: meta
-        {:parse_error, "#{name}:#{line}: #{inspect(message)} #{inspect(token)}"}
+      {:error, reason} ->
+        {:parse_error, "#{name}: #{inspect(reason)}"}
     end
   end
 
-  defp visit({:try, meta, args} = node, acc) when is_list(args) do
-    {node, [{line(meta), :try} | acc]}
+  defp visit({:try, _meta, args} = node, acc) when is_list(args) do
+    {node, [at(node, :try) | acc]}
   end
 
-  defp visit({:throw, meta, args} = node, acc) when is_list(args) do
-    {node, [{line(meta), :throw} | acc]}
+  defp visit({:throw, _meta, args} = node, acc) when is_list(args) do
+    {node, [at(node, :throw) | acc]}
   end
 
-  defp visit({definition, meta, args} = node, acc)
+  defp visit({definition, _meta, args} = node, acc)
        when definition in @definitions and is_list(args) do
-    {node, clauses(args, line(meta)) ++ acc}
+    {node, clauses(args, node) ++ acc}
   end
 
   defp visit(node, acc), do: {node, acc}
 
-  defp clauses(args, line) do
+  # SOURCEROR WRAPS LITERALS, AND THAT SILENTLY UNDID THIS CHECK. Where
+  # `Code.string_to_quoted/2` gives a def's clauses as a plain keyword list -- `[do: ...,
+  # rescue: ...]` -- Sourceror encodes every literal as `{:__block__, meta, [literal]}`, so
+  # the keys are nodes and `Keyword.keyword?/1` answers false. Swapping the parser under an
+  # unchanged `Keyword.keys/1` turned the def-rescue check off and reported the control file
+  # as clean, which is the second time that same file has caught this gate. Keys are read
+  # through `key_of/1` now, in either encoding.
+  defp clauses(args, definition) do
     args
-    |> Enum.filter(&Keyword.keyword?/1)
+    |> Enum.filter(&is_list/1)
     |> Enum.flat_map(fn kw ->
       kw
-      |> Keyword.keys()
-      |> Enum.filter(&(&1 in @clause_keys))
-      |> Enum.map(&{line, &1})
+      |> Enum.filter(&match?({_key, _value}, &1))
+      |> Enum.filter(fn {key, _value} -> key_of(key) in @clause_keys end)
+      |> Enum.map(fn {key, value} -> at(value, key_of(key), definition) end)
     end)
   end
 
-  defp line(meta), do: Keyword.get(meta, :line, 0)
+  defp key_of({:__block__, _meta, [key]}) when is_atom(key), do: key
+  defp key_of(key) when is_atom(key), do: key
+  defp key_of(_), do: nil
+
+  # The range of the construct, falling back to the node that encloses it. A clause keyword
+  # carries no range of its own, so what is reported is the range of its VALUE -- the clause
+  # body, which is the line below the `rescue` keyword itself. That is close enough to be
+  # the line a reader edits, and it beats naming the enclosing `def`, which can be forty
+  # lines up.
+  defp at(node, construct, fallback \\ nil) do
+    case range(node) || range(fallback) do
+      %{start: [line: line, column: column]} -> {line, column, construct}
+      _ -> {0, 0, construct}
+    end
+  end
+
+  defp range(nil), do: nil
+
+  defp range(node) do
+    Sourceror.get_range(node)
+  end
 
   @doc "Violations across a list of files, as printable lines."
   def check(paths) do
@@ -108,8 +143,8 @@ defmodule CheckNoExceptions do
           []
 
         {:ok, found} ->
-          Enum.map(found, fn {line, construct} ->
-            "#{path}:#{line}: #{construct} -- #{@why[construct]}"
+          Enum.map(found, fn {line, column, construct} ->
+            "#{path}:#{line}:#{column}: #{construct} -- #{@why[construct]}"
           end)
 
         {:parse_error, message} ->
@@ -233,7 +268,12 @@ defmodule CheckNoExceptions do
         {:ok, found} = scan(source, "control.ex")
         failed = found != []
         good = failed == should_fail
-        detail = if failed, do: " #{inspect(Enum.map(found, &elem(&1, 1)))}", else: ""
+        detail =
+          if failed do
+            " " <> inspect(Enum.map(found, fn {line, column, construct} -> "#{construct}@#{line}:#{column}" end))
+          else
+            ""
+          end
         IO.puts("  #{if good, do: "ok ", else: "BAD"} #{label}: #{if failed, do: "rejected", else: "accepted"}#{detail}")
         good
       end)

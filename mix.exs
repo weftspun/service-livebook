@@ -28,7 +28,12 @@ defmodule ServiceLivebook.MixProject do
   defp deps do
     [
       {:livebook, "~> 0.19.9"},
-      {:mox, "~> 1.2", only: :test}
+      {:mox, "~> 1.2", only: :test},
+      # `scripts/check_no_exceptions.exs` reads source rather than text. Sourceror gives it
+      # the range of the offending clause -- line and column, start and end -- so a
+      # violation is reported at the construct rather than at the definition that encloses
+      # it, and so the gate can be turned into a fixer without being rewritten.
+      {:sourceror, "~> 1.12", only: [:dev, :test], runtime: false}
     ]
   end
 end

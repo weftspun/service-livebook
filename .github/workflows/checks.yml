@@ -33,8 +33,14 @@ jobs:
         with:
           elixir-version: "1.18"
           otp-version: "27"
+      # `mix deps.get` because the gate parses with Sourceror, which is a dependency. It
+      # ran standalone while it used `Code.string_to_quoted/2`; what the dependency buys is
+      # the range of the offending clause, and a path to fixing violations rather than
+      # reporting them.
+      - run: mix deps.get
       # The controls first. A gate that cannot fail certifies the defect, and this one has
-      # already been wrong once: it missed `def ... rescue`, which is the way the construct
-      # is usually written.
-      - run: elixir scripts/check_no_exceptions.exs --self-test
-      - run: elixir scripts/check_no_exceptions.exs
+      # been wrong twice: it missed `def ... rescue`, which is how the construct is usually
+      # written, and then the move to Sourceror turned that same check off again, because
+      # Sourceror wraps keyword keys in `__block__` nodes and the key match stopped matching.
+      - run: mix run --no-start scripts/check_no_exceptions.exs --self-test
+      - run: mix run --no-start scripts/check_no_exceptions.exs
