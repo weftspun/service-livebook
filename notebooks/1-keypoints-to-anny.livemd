@@ -142,54 +142,55 @@ The view index walks the `sphere_hammersley_sequence`. A front view picked by ha
 error of five stacked soda cans along the travel axis against three and a half across it,
 which is a measurement of the view rather than of the fit.
 
-## The fit, and where this loop stops today
+## The fit, which does exist
 
-`AnnyInverter` is the one stage in this loop with no command line, so it would run here
-rather than through `pixi_run`. It does not run, and the reason is a shape mismatch that no
-amount of wiring fixes.
+**A previous version of this notebook said no points-to-pose solver existed here. That was
+wrong, and the correction is worth more than the claim was.**
+`4-entities/anny-pose-retarget-work/fit_joints_to_anny.py` solves a full 104-bone pose from
+21 three-dimensional joint positions, by Umeyama for the global placement and LBFGS with a
+strong-Wolfe line search for the rotations. What was missing was only the front end: that
+file takes 3D world positions and a detector gives 2D pixels.
 
-**Both solvers fit to vertices, and the detector produces points.** `AnnyInverter.__call__`
-takes `vertices_target (B, V, 3)`, and SOMA-X's `PoseInversion.fit` takes
-`posed_vertices (B, V, 3)` on any supported topology. RF-DETR gives 17 two-dimensional
-keypoints with confidences. Nothing in this workspace lifts the second into the first, and
-inventing a lift here would put a number in front of the referee that no measurement
-supports.
-
-SOMA-X is doubly unavailable: its assets are a GitHub release artifact fetched by
-`assets/fetch.sh`, and the checked-out `assets/` directory contains that script and nothing
-else.
-
-```python
-raise PreconditionFailed(
-    "No fit. AnnyInverter takes vertices_target (B, V, 3) and SOMA-X's "
-    "PoseInversion.fit takes posed_vertices (B, V, 3); RF-DETR supplies 17 2D keypoints, "
-    "and nothing here lifts points to vertices. SOMA-X's assets are a release artifact, "
-    "and assets/ holds only fetch.sh. The round is unavailable, not zero-scored."
-)
-```
-
-That raise is the loop reporting a stage it cannot run, the same way loop 4 reports its
-latent arm. The cells below are what runs once a fit exists, and they are kept rather than
-deleted so the shape of the missing piece stays visible: a fit has to produce per-region
-residuals in rig units and a stature, and nothing else.
+`priv/python/loop1_fit.py` is that front end, built on the same two ideas. The forward is
+already differentiable -- `KeypointsRegressor` is a per-vertex convex blend from vertices to
+the named keypoints, and everything from pose parameters to those keypoints is torch -- so
+composing a weak-perspective camera onto the end makes the loss a reprojection distance and
+no inverse model is needed.
 
 ```python
 import numpy as np
 
+from loop1_fit import build_model, fit_2d, residuals_by_region, detect_keypoints
+from anny.keypoints import KeypointsRegressor
 
-def residuals_by_region(fitted_px, target_px):
-    """Per-keypoint distances, grouped into the regions the referee names.
-
-    Only two of the five regions can ever be filled from a 17-point detector, and that is
-    the finding rather than an omission. The keypoint asset carries COCO-17 plus six foot
-    points, so there is a body and there are feet. There is no face beyond five head
-    points, and there are no hands at all: the wrist is where the 17 stop.
-    """
-    distance = np.linalg.norm(fitted_px - target_px, axis=1)
-    body = [COCO17.index(n) for n in COCO17 if not n.endswith("ankle")]
-    feet = [COCO17.index(n) for n in COCO17 if n.endswith("ankle")]
-    return {"body": distance[body], "feet": distance[feet]}
+model = build_model()
+regressor = KeypointsRegressor.coco(model)
+target2d, confidence = detect_keypoints(PHOTO)
+fit = fit_2d(model, regressor, target2d, confidence)
+print(f"median {float(np.median(fit['residual_px'])):.2f} px of {fit['stature_px']:.0f} px stature")
 ```
+
+**Measured, by a known-answer round trip rather than by inspection.** Pose the rig, project
+its own keypoints through a known camera, throw the pose away and fit it back:
+`priv/python/test_loop1_fit.py` recovers a median of 1.56 px on a 590 px stature, which is
+0.263% of stature, or 4.5 mm on a 1.7 m body -- about one pencil. Shuffled targets reach
+111.8 px, so the round trip is measuring the solve rather than the rest pose.
+
+**The blocker moved, and it is now smaller.** Nothing here carries `rfdetr`: rf-detr-mcp
+documents a local virtual environment that is not in the checkout, and no pixi environment
+declares it either, so `detect_keypoints` raises. The fit needs none of that. Seventeen
+points from anywhere -- a projection of an authored pose, a hand annotation, another
+detector -- go straight into `fit_2d`.
+
+```python
+fit_residuals = residuals_by_region(fit["residual_px"])
+stature = fit["stature_px"]
+```
+
+Residual and stature are both in pixels, so the referee's fraction-of-stature thresholds
+apply unchanged. The fit does not recover depth: two poses that project to the same pixels
+are indistinguishable to this loss, and `pose-consensus/python/depth_term.py` is what
+exists for that and is not wired in here.
 
 ## The referee, which is not the score
 
@@ -238,7 +239,8 @@ record = {
     "rig": {"topology": "makehuman", "vertices": 19158, "keypoint_asset_points": 23},
     "renderer": {"engine": "mitsuba", "variant": "llvm_ad_rgb", "threads": 1,
                  "cameras": "sphere_hammersley_sequence"},
-    "referee": "not run: no fit, see the fit section",
+    "fit": {"solver": "loop1_fit.fit_2d", "camera": "weak perspective",
+            "round_trip_median_px": 1.56, "round_trip_pct_of_stature": 0.263},
     "baseline": history.baseline,
     "rounds": [r.__dict__ for r in history.rounds],
 }
