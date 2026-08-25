@@ -53,7 +53,7 @@ CONSENSUS = Path(r"C:\weftspun-keypoint\3-interactor\pose-consensus\python")
 sys.path.insert(0, str(HARNESS))
 sys.path.insert(0, str(CONSENSUS))
 
-from weft_loop import run, pixi_run, plot, household
+from weft_loop import run, pixi_run, plot, household, PreconditionFailed
 
 COCO17 = ["nose", "left_eye", "right_eye", "left_ear", "right_ear",
           "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
@@ -130,23 +130,83 @@ The view index walks the `sphere_hammersley_sequence`. A front view picked by ha
 error of five stacked soda cans along the travel axis against three and a half across it,
 which is a measurement of the view rather than of the fit.
 
+## The fit, and where this loop stops today
+
+`AnnyInverter` is the one stage in this loop with no command line, so it would run here
+rather than through `pixi_run`. It does not run, and the reason is a shape mismatch that no
+amount of wiring fixes.
+
+**Both solvers fit to vertices, and the detector produces points.** `AnnyInverter.__call__`
+takes `vertices_target (B, V, 3)`, and SOMA-X's `PoseInversion.fit` takes
+`posed_vertices (B, V, 3)` on any supported topology. RF-DETR gives 17 two-dimensional
+keypoints with confidences. Nothing in this workspace lifts the second into the first, and
+inventing a lift here would put a number in front of the referee that no measurement
+supports.
+
+SOMA-X is doubly unavailable: its assets are a GitHub release artifact fetched by
+`assets/fetch.sh`, and the checked-out `assets/` directory contains that script and nothing
+else.
+
+```python
+raise PreconditionFailed(
+    "No fit. AnnyInverter takes vertices_target (B, V, 3) and SOMA-X's "
+    "PoseInversion.fit takes posed_vertices (B, V, 3); RF-DETR supplies 17 2D keypoints, "
+    "and nothing here lifts points to vertices. SOMA-X's assets are a release artifact, "
+    "and assets/ holds only fetch.sh. The round is unavailable, not zero-scored."
+)
+```
+
+That raise is the loop reporting a stage it cannot run, the same way loop 4 reports its
+latent arm. The cells below are what runs once a fit exists, and they are kept rather than
+deleted so the shape of the missing piece stays visible: a fit has to produce per-region
+residuals in rig units and a stature, and nothing else.
+
+```python
+import numpy as np
+
+
+def residuals_by_region(fitted_px, target_px):
+    """Per-keypoint distances, grouped into the regions the referee names.
+
+    Only two of the five regions can ever be filled from a 17-point detector, and that is
+    the finding rather than an omission. The keypoint asset carries COCO-17 plus six foot
+    points, so there is a body and there are feet. There is no face beyond five head
+    points, and there are no hands at all: the wrist is where the 17 stop.
+    """
+    distance = np.linalg.norm(fitted_px - target_px, axis=1)
+    body = [COCO17.index(n) for n in COCO17 if not n.endswith("ankle")]
+    feet = [COCO17.index(n) for n in COCO17 if n.endswith("ankle")]
+    return {"body": distance[body], "feet": distance[feet]}
+```
+
 ## The referee, which is not the score
 
 ```python
 from soma_referee import referee
 
-verdict = referee(fit_residuals, stature)
-print(verdict.call)
-for region, pct in verdict.residual_pct.items():
-    print(f"  {region:>10}  {pct:5.2f}% of stature  {verdict.household(region)}")
+
+def report(fit_residuals, stature):
+    """What to do with a fit, once there is one.
+
+    A function rather than loose statements, because loose statements would name two
+    variables nothing in this notebook can produce, and a cell that cannot run should say
+    so by taking its inputs rather than by failing at the first line.
+    """
+    verdict = referee(fit_residuals, stature)
+    print(verdict.call)
+    for region, pct in verdict.residual_pct.items():
+        print(f"  {region:>10}  {pct:5.2f}% of stature  {verdict.household(region)}")
+    return verdict
 ```
 
 `FITS`, `IMPOSSIBLE`, `HANDS_UNTRUSTED` or `NOT_RUN`. A missing region is `NOT_RUN` and
-never a pass, which is the rule the harness applies to a missing environment as well. The
-referee already reports each residual as a household object, so nothing here reformats it.
+never a pass, which is the rule the harness applies to a missing environment as well.
 
-`fit_residuals` and `stature` come from the `AnnyInverter` solve. That solve is the one
-piece of this loop with no CLI, so it runs in a cell of its own above this one.
+**Expect `NOT_RUN` here, and that is the correct answer rather than a fault.** The referee
+judges five regions and this loop can supply two. Face and hands need what a 17-point
+detector does not carry, so the honest verdict is that the fit was not refereed, not that
+it passed. Closing that gap is what a wholebody head is for; until then this cell reports
+which regions were unavailable rather than averaging over the ones that were.
 
 ## Run it
 
@@ -166,7 +226,7 @@ record = {
     "rig": {"topology": "makehuman", "vertices": 19158, "keypoint_asset_points": 23},
     "renderer": {"engine": "mitsuba", "variant": "llvm_ad_rgb", "threads": 1,
                  "cameras": "sphere_hammersley_sequence"},
-    "referee": {"call": str(verdict.call), "residual_pct": verdict.residual_pct},
+    "referee": "not run: no fit, see the fit section",
     "baseline": history.baseline,
     "rounds": [r.__dict__ for r in history.rounds],
 }
