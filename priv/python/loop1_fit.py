@@ -11,6 +11,14 @@ COCO-17 and subset every target to it. `todo.md` names loop one's detector as
 a fullbody target has a home and a 17-point subset was throwing 87 of them away. Names now
 arrive with the targets and nothing here asserts a length.
 
+RETRACTION, MEASURED AFTER rfdetr WAS INSTALLED: THERE IS NO FULLBODY CHECKPOINT TO READ.
+`RFDETRKeypointPreviewConfig` in rfdetr 1.9.4 carries `num_keypoints_per_class = [17]`, so
+the published preview model produces COCO-17 and nothing wider. The paragraph above is right
+that a subset throws away 87 points, and wrong that the detector supplies them. What follows
+is that a detector target takes the 23-point regressor path, whose first 17 labels are
+COCO-17, and that the referee then judges two regions and reports NOT_RUN for three. The
+fullbody path stays for targets that are genuinely fullbody, such as the round trip's.
+
 TWO FORWARDS, CHOSEN BY WHICH VOCABULARY THE NAMES BELONG TO.
 
 * Bone joints, `bone_poses[0, :, :3, 3]`, indexed by `bone_labels`. This is the fullbody
@@ -37,10 +45,17 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-# The referee judges five regions. A fullbody vocabulary can fill all five; a 17-point one
-# fills two. Which region a point belongs to is decided by its name, so the mapping is data
-# rather than a chain of conditionals somebody has to keep in step with the rig.
-HAND_MARKERS = ("finger", "thumb", "wrist", "hand", "metacarpal")
+# The referee judges five regions. Which region a point belongs to is decided by its name,
+# so the mapping is data rather than a chain of conditionals somebody has to keep in step
+# with the rig.
+#
+# WRIST IS NOT A HAND, AND THAT IS A MEASUREMENT RATHER THAN A TASTE. It was in this tuple,
+# and a COCO-17 target then filled `left_hand` and `right_hand` with one point each: the
+# wrist. The referee would have judged a hand from a single boundary joint and called it a
+# region, which is the pass a missing region exists to prevent. The fullbody vocabulary has
+# `wrist.L` and `wrist.R` and 19 further points per hand, so it loses nothing by counting a
+# wrist as body. `test_loop1_fit.py` drives a 17-point target and fails if a hand fills.
+HAND_MARKERS = ("finger", "thumb", "hand", "metacarpal")
 FOOT_MARKERS = ("toe", "foot", "ankle", "heel")
 FACE_MARKERS = ("head", "eye", "ear", "nose", "jaw", "tongue", "lip", "brow", "orbicularis",
                 "temporalis", "levator", "risorius", "mentalis", "buccinator", "zygomatic",
@@ -101,14 +116,54 @@ def region_of(name: str) -> str:
     return "body"
 
 
-def solve_camera(points3d, target2d, weights):
+def image_axes(model, dtype=torch.float64):
+    """(right, up) vertex-component indices for this rig, measured rather than assumed.
+
+    THE FIT PROJECTED X AND Y AND THE RIG IS Z-UP, AND EVERY POSE IT PRODUCED WAS ROTATED.
+    ANNY's rest mesh measures X 1.046, Y 0.434, Z 1.660, so the tall axis is Z and the axis
+    the old code fed to image-vertical was the body's depth. Against an upright photograph
+    the solver's only way to match was to rotate the whole figure about ninety degrees, and
+    the ninety-six grid renders show exactly that. The known-answer round trip did not catch
+    it because it built its targets through the same two axes, so it was wrong and
+    self-consistent together.
+
+    CLAUDE.md states the rule this breaks: conventions are data, and an up axis is parsed
+    and never assumed. So it is read off the rest pose here. Up is the longest rest extent,
+    right is the longest of the two that remain, and a rig that is wider than it is tall
+    raises rather than quietly deciding a lying figure is upright.
+    """
+    with torch.no_grad():
+        verts = model()["vertices"][0].to(dtype)
+        extent = (verts.max(0).values - verts.min(0).values)
+    order = torch.argsort(extent, descending=True)
+    up, right = int(order[0]), int(order[1])
+    if float(extent[up]) < 1.2 * float(extent[right]):
+        raise ValueError(
+            f"rest extents {[round(float(e), 3) for e in extent]} do not name an up axis: "
+            "the longest is not clearly longer than the next, so this rig is not a standing body"
+        )
+    return right, up
+
+
+def to_image(points3d, axes):
+    """World points onto the image plane: right stays, up is negated.
+
+    Image rows count downward and the rig's up axis counts upward, so the sign is not
+    cosmetic. `solve_camera` fits one POSITIVE scale, which cannot absorb a flip, and a fit
+    that has to absorb it will roll the body instead.
+    """
+    right, up = axes
+    return torch.stack([points3d[:, right], -points3d[:, up]], dim=1)
+
+
+def solve_camera(points3d, target2d, weights, axes):
     """Closed form for weak perspective: one scale and a 2D translation, exactly.
 
     Minimising sum w * ||s * xy + t - target||^2 over (s, tx, ty) is linear least squares.
     This is `fit_one`'s reasoning for starting from Umeyama: the global placement is not what
     a line search should spend itself on.
     """
-    xy = points3d[:, :2]
+    xy = to_image(points3d, axes)
     w = weights[:, None]
     xm = (w * xy).sum(0) / w.sum()
     tm = (w * target2d).sum(0) / w.sum()
@@ -155,14 +210,15 @@ def fit_2d(model, target2d, names, confidence=None, regressor=None, iters=120,
         points = out["bone_poses"][0, :, :3, 3] if regressor is None else regressor(out)[0]
         return points.to(dtype)[idx]
 
+    axes = image_axes(model, dtype)
     with torch.no_grad():
-        scale0, t0 = solve_camera(keypoints3d(), target2d, weights)
+        scale0, t0 = solve_camera(keypoints3d(), target2d, weights, axes)
     log_scale = torch.tensor([float(torch.log(scale0.clamp_min(1e-9)))], dtype=dtype,
                              requires_grad=True)
     trans = t0.clone().detach().requires_grad_(True)
 
     def projected():
-        return keypoints3d()[:, :2] * torch.exp(log_scale) + trans
+        return to_image(keypoints3d(), axes) * torch.exp(log_scale) + trans
 
     opt = torch.optim.LBFGS([rotvec, log_scale, trans], max_iter=iters,
                             line_search_fn="strong_wolfe", tolerance_grad=1e-14)
@@ -184,7 +240,11 @@ def fit_2d(model, target2d, names, confidence=None, regressor=None, iters=120,
         fitted = projected()
         residual = (fitted - target2d).norm(dim=1)
         verts = out["vertices"][0].to(dtype)
-        stature = float((verts[:, 1].max() - verts[:, 1].min()) * torch.exp(log_scale))
+        # Stature is the up axis, which is the whole point of measuring the axes. It read
+        # component 1 here, the body's depth, so every "percent of stature" this file has
+        # ever reported was normalised by 0.434 where it should have used 1.660.
+        stature = float((verts[:, axes[1]].max() - verts[:, axes[1]].min())
+                        * torch.exp(log_scale))
 
     return {
         "pose": pose.detach(),
@@ -193,6 +253,7 @@ def fit_2d(model, target2d, names, confidence=None, regressor=None, iters=120,
         "keypoints2d": fitted,
         "residual_px": residual,
         "stature_px": stature,
+        "axes": {"right": axes[0], "up": axes[1]},
         "camera": {"scale": float(torch.exp(log_scale)), "translation": trans.detach().tolist()},
     }
 
@@ -211,13 +272,65 @@ def residuals_by_region(names, residual_px) -> dict:
     return {region: np.asarray(values) for region, values in grouped.items()}
 
 
-def detect_keypoints(image_path, threshold: float = 0.4):
-    """The fullbody detector's keypoints for one image, or a refusal naming what is absent.
+def coco_regressor(model):
+    """The 23-point regressor and the 17 names a COCO detector actually produces.
 
-    Nothing checked out here carries `rfdetr`: rf-detr-mcp documents a local virtual
-    environment that is not in the checkout, and no pixi environment in the corpus repository
-    declares it. The fit needs none of this. Points from anywhere else -- a projection of an
-    authored pose, a hand annotation, another detector -- go straight into `fit_2d`.
+    THE PUBLISHED DETECTOR IS 17 POINTS, AND THE HEADER ABOVE IS RETRACTED ON THAT POINT.
+    `RFDETRKeypointPreviewConfig` in rfdetr 1.9.4 carries `num_keypoints_per_class = [17]`,
+    so "RFDetr Fullbody Coco Keypoints" names a model this package does not ship. The bone
+    path stays for a target that is genuinely fullbody. A 17-row target belongs in this
+    vocabulary instead, because `bone_labels` has no `nose` and no `left_eye` and matching
+    17 detector rows against 104 bone names is what `fit_2d` refuses by design.
+
+    The regressor's first 17 labels are COCO-17 in COCO's own row order, which is checked
+    here rather than assumed: a reordered `coco.pth` would otherwise fit every point to the
+    wrong joint and still report a small residual.
+    """
+    from anny.keypoints import KeypointsRegressor
+
+    regressor = KeypointsRegressor.coco(model)
+    names = list(regressor.labels[:17])
+    if names != list(COCO17):
+        raise ValueError(f"coco.pth's first 17 labels are {names}, and COCO's order is {list(COCO17)}")
+    return regressor, names
+
+
+# COCO's own keypoint order. Held here so `coco_regressor` can check the asset against it
+# rather than trust it, and so a caller can name the vocabulary without loading the rig.
+COCO17 = (
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle",
+)
+
+
+def write_posed_mesh(model, pose, path):
+    """Write the mesh the fit implies, in the two arrays `render_view.py` reads.
+
+    The renderer takes `verts` and `faces` from an npz, so the fit has to be turned into a
+    mesh before anything can be rendered from it. Nothing did that, which is why the loop's
+    `propose` read a file no cell wrote.
+
+    The topology is the 19,158-vertex makehuman one, and it is asserted rather than assumed:
+    the 13,718-vertex body submodel would write a file that renders and is a different rig.
+    """
+    with torch.no_grad():
+        out = model(pose_parameters=pose)
+    verts = out["vertices"][0].detach().cpu().numpy()
+    faces = np.asarray(model.faces.detach().cpu().numpy(), dtype=np.int64)
+    if verts.shape[0] != 19158:
+        raise ValueError(f"{verts.shape[0]} vertices, and render_corpus.py needs 19158")
+    np.savez(path, verts=verts.astype(np.float64), faces=faces)
+    return path
+
+
+def detect_keypoints(image_path, threshold: float = 0.4):
+    """The detector's keypoints for one image, or a refusal naming what is absent.
+
+    Returns points, confidences and the names of the rows. The names travel with the points
+    because the row count decides the vocabulary, and a caller that assumes one silently
+    fits the wrong joints.
     """
     from weft_loop import PreconditionFailed
 
@@ -225,10 +338,9 @@ def detect_keypoints(image_path, threshold: float = 0.4):
         from rfdetr import RFDETRKeypointPreview
     except ImportError as error:
         raise PreconditionFailed(
-            "no environment here carries rfdetr: rf-detr-mcp documents a local virtual "
-            "environment that is not in the checkout, and no pixi environment in the corpus "
-            "repository declares it. The fit does not need this; reading keypoints off a "
-            "photograph does."
+            "no environment here carries rfdetr. The notebook's setup cell declares it, so "
+            "run that cell; outside the notebook, install rfdetr in the environment that "
+            "calls this. The fit does not need it; reading keypoints off a photograph does."
         ) from error
 
     from PIL import Image
@@ -236,4 +348,11 @@ def detect_keypoints(image_path, threshold: float = 0.4):
     detection = RFDETRKeypointPreview().predict(Image.open(image_path), threshold=threshold)
     if len(detection) == 0:
         raise PreconditionFailed(f"no person detected in {image_path} at threshold {threshold}")
-    return np.asarray(detection.xy[0]), np.asarray(detection.keypoint_confidence[0])
+    xy = np.asarray(detection.xy[0])
+    confidence = np.asarray(detection.keypoint_confidence[0])
+    if xy.shape[0] != len(COCO17):
+        raise PreconditionFailed(
+            f"the detector returned {xy.shape[0]} points and this front end names {len(COCO17)}. "
+            "Name the rows before fitting rather than trimming them."
+        )
+    return xy, confidence, list(COCO17)

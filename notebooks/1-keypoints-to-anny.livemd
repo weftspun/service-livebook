@@ -1,5 +1,3 @@
-<!-- livebook:{"default_language":"python"} -->
-
 # Loop 1: RF-DETR keypoints, ANNY, EditScore
 
 ```elixir
@@ -18,8 +16,47 @@ requires-python = "==3.11.*"
 dependencies = [
   "pillow==11.1.0",
   "numpy==2.2.3",
-  "matplotlib==3.10.1"
+  "matplotlib==3.10.1",
+  # The fit runs in this interpreter rather than in a pixi subprocess, so torch is
+  # declared here. CLAUDE.md blocklists `uv` for project environments and exempts an
+  # embedded interpreter that pins its dependencies in source, which is this cell:
+  # the pins travel with the notebook and a reader can rebuild the environment from it.
+  # CPU wheels, because the card belongs to the renderer and the scorer. `anny` brings
+  # `roma`, and it is named anyway so the notebook states what it imports.
+  # ONE INTERPRETER HOLDS THIS WHOLE LOOP, AND THAT IS THE RULE RATHER THAN A CONVENIENCE.
+  # `check_pixi_free.py` fails the build if this project shells out to another environment
+  # manager, because a second environment is one the notebook does not describe. Everything
+  # the loop needs is named here, so a reader rebuilds it from the file.
+  "torch>=2.6",
+  "torchvision",
+  "anny",
+  "roma",
+  # The detector. `rf-detr-mcp` documented a virtual environment on the Desktop and that
+  # directory is gone, so the notebook declares it rather than pointing at a desk.
+  "rfdetr",
+  # The renderer, pinned exactly. It is a measuring instrument, and an instrument that
+  # changes version between two runs has made the two runs incomparable.
+  "mitsuba==3.9.1",
+  # The scorer, and its four-bit loader.
+  "editscore",
+  "transformers",
+  "accelerate",
+  "peft",
+  "bitsandbytes",
+  "qwen-vl-utils",
+  "json-repair"
 ]
+
+# The card, because the scorer is an 8B backbone and CPU wheels would make the loop measure
+# the loader. Declared as an explicit index so the pins stay readable in this cell.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 ```
 
 ## What this loop is
@@ -30,15 +67,18 @@ The referee is a second opinion answering a question EditScore cannot: whether a
 could hold that pose at all.
 
 Nothing in this notebook runs until you run it. Every cell that touches the card is a
-subprocess into a pixi environment, so reading the notebook costs nothing.
+subprocess into a pixi environment, so reading the notebook costs nothing. The fit is the
+one exception and it touches no card: it runs on CPU in this notebook's own interpreter,
+which is why the setup cell above declares torch.
 
 ## Two facts that will bite before anything else does
 
-**The detector is the fullbody one, so the vocabulary is ANNY's 104 bone labels.** An
-earlier version of this notebook subset every target to COCO-17 and then reported that the
-referee could not run. It could not run because 87 of the 104 points were being thrown
-away. Nothing here asserts a length now: names arrive with the targets, and a name the
-forward does not carry raises rather than shortening the array.
+**The detector is COCO-17, and the claim that it was fullbody is retracted.** rfdetr
+1.9.4's `RFDETRKeypointPreviewConfig` carries `num_keypoints_per_class = [17]`, so no
+fullbody checkpoint ships and the vocabulary for a detector target is the 23-point
+regressor's first 17. ANNY's 104 bone labels stay the vocabulary of the round trip, which
+projects the rig's own joints. Nothing here asserts a length: names arrive with the
+targets, and a name the forward does not carry raises rather than shortening the array.
 
 **`render_corpus.py` requires the 19,158-vertex makehuman topology** with
 `remove_unattached_vertices=False`. The 13,718-vertex body submodel that `anny_rig.py`
@@ -55,20 +95,34 @@ CONSENSUS = Path(r"C:\weftspun-keypoint\3-interactor\pose-consensus\python")
 sys.path.insert(0, str(HARNESS))
 sys.path.insert(0, str(CONSENSUS))
 
-from weft_loop import run, pixi_run, plot, household, PreconditionFailed, require_whole_sequence
+from weft_loop import (run, corpus_module, plot, household, PreconditionFailed,
+                       require_whole_sequence, describe_camera, nearest_view)
+from loop1_fit import (build_model, bone_names, coco_regressor, fit_2d, detect_keypoints,
+                       residuals_by_region, write_posed_mesh)
 ```
 
 ## Inputs
 
 ```python
-PHOTO = r"C:\anny_test\hv_0.png"
-WORK = Path(r"C:\weftspun-keypoint\.loop1")
-WORK.mkdir(exist_ok=True)
+# hv_0.png stood here and the detector finds nothing in it at threshold 0.4. Measured over
+# the three renders at 1024 x 1024: hv_0 gives 0 detections at 0.4 and 2 at 0.2, while hv_1
+# and hv_2 give one person at 0.999 and 1.000. So the default is a render the detector can
+# actually read, and the failure it used to produce was about this image rather than the code.
+PHOTO = r"C:\anny_test\hv_1.png"
+# The outputs go where they can be looked at. A render nobody opens is not a result, and
+# a hidden directory beside a checkout is where a result goes to not be looked at.
+WORK = Path.home() / "Desktop" / "loop1-keypoints-to-anny"
+WORK.mkdir(parents=True, exist_ok=True)
 ```
 
-`hv_0.png` is an ANNY render standing in for a photograph so that the path resolves. It is
+`hv_1.png` is an ANNY render standing in for a photograph so that the path resolves. It is
 not a photograph, and a render scored against itself measures the renderer rather than the
 fit, so point `PHOTO` at a real image before reading anything into the number.
+
+The residual it produces is small and that is not evidence of a correct pose. Seventeen
+points constrain 104 bones loosely, so the solve is underdetermined and a low reprojection
+error is what an underdetermined fit gives. The referee, not the residual, is what says
+whether a body could hold the result, and on 17 points it answers NOT_RUN.
 
 Do not point `PHOTO` at `coco_person_commercial_val2017`. That set is the blinded
 holdout: not inspected while developing, not used to pick a checkpoint, a threshold or a
@@ -77,61 +131,117 @@ consulted during development has been trained on by hand, just slowly.
 
 ## Detect
 
-```python
-def detect(path):
-    result = pixi_run("corpus", [
-        str(Path(r"C:\weftspun-keypoint\1-transport\rf-detr-mcp") / "test_keypoints.py"),
-        str(path),
-    ])
-    return result.stdout
-```
-
-RF-DETR runs on CPU here by design, so this step does not compete with the renderer or
-the scorer for the card.
+The detector runs in this interpreter, through `loop1_fit.detect_keypoints` below. A cell
+here used to shell into `rf-detr-mcp/test_keypoints.py` in another environment, and it is
+gone: the same model, loaded once, in the process that fits.
 
 ## Fit, render, score
 
 ```python
-VIEWS = 8
+# FORTY-EIGHT, AND THE NUMBER IS MEASURED RATHER THAN PREFERRED.
+# At n=8 the closest view in the sequence to a front view is 48.2 degrees away, which is
+# nearly half a right angle. The scorer was being handed a picture of a different side of
+# the body and asked whether the pose matched. Distance from the sequence to a front view,
+# measured over the whole sequence at each count:
+#
+#     n      nearest front view     on the card      llvm at one thread
+#     8               48.2 deg             8 s                  10 min
+#     16              29.4 deg            16 s                  21 min
+#     24              23.3 deg            24 s                  31 min
+#     48              12.9 deg            48 s                  62 min
+#     96               8.5 deg            96 s                 125 min
+#
+# 8 to 16 halves the gap and 16 to 48 halves it again; 48 to 96 buys 4.4 degrees for double
+# the time. So 48. The whole sequence is still rendered every round, which is the rule, and
+# it costs 48 s a round on the card.
+VIEWS = 48
 
 
-def propose(i):
-    """Render the whole sequence, never one index of it.
+render_view = corpus_module("render_view")
+import weft_score
 
-    An earlier version rendered index i-1 on round i, so three rounds produced views 0, 1
-    and 2 -- a prefix, which `check_view_selection` reports as a defect for a measured
-    reason. At n=8 the sequence's pitches are -90, -30, 0, 9.6, 19.5, 30, 41.8 and 56.4
-    degrees, so dropping index 0 removes the only view below -30 and any subset silently
-    changes the pitch distribution. `require_whole_sequence` raises rather than warning.
+
+def make_propose(model, target2d, names, confidence, regressor):
+    """Build the round's proposer from what the fit already has.
+
+    A closure rather than free variables, because this cell sits above the cell that fits
+    and a name read from below is a name that can be missing. `check_notebooks.py` reads
+    the notebook top to bottom and fails on exactly that.
     """
-    require_whole_sequence(range(VIEWS), VIEWS)
-    rendered = []
-    for view in range(VIEWS):
-        out = WORK / f"fit_{i}_view{view}.png"
-        pixi_run("anny", [
-            str(CORPUS / "render_view.py"),
-            str(WORK / f"fit_{i}.npz"), str(out),
-            "--index", str(view), "--views", str(VIEWS),
-            "--variant", "llvm_ad_rgb", "--threads", "1",
-        ])
-        rendered.append(str(out))
-    return rendered[0]
+
+    def propose(i):
+        """Fit, write the mesh that fit implies, and render the whole sequence.
+
+        THE ROUND HAS TO CHANGE SOMETHING OR THE LOOP MEASURES NOTHING. Each round refits
+        with more LBFGS iterations, so round 0 is 40 and round 2 is 120, and the score
+        answers whether the extra iterations bought anything. A `propose` that returned the
+        same render three times would produce three identical scores and zero deltas.
+
+        Render the whole sequence, never one index of it. An earlier version rendered index
+        i-1 on round i, so three rounds produced views 0, 1 and 2 -- a prefix, which
+        `check_view_selection` reports as a defect for a measured reason. At n=8 the
+        sequence's pitches are -90, -30, 0, 9.6, 19.5, 30, 41.8 and 56.4 degrees, so
+        dropping index 0 removes the only view below -30 and any subset silently changes the
+        pitch distribution. `require_whole_sequence` raises rather than warning.
+        """
+        require_whole_sequence(range(VIEWS), VIEWS)
+        round_fit = fit_2d(model, target2d, names, confidence, regressor=regressor,
+                           iters=40 * (i + 1))
+        mesh = write_posed_mesh(model, round_fit["pose"], WORK / f"fit_{i}.npz")
+        rendered = []
+        directions = []
+        for view in range(VIEWS):
+            out = WORK / f"fit_{i}_view{view}.png"
+            # THE CARD, AND THIS LOOP GIVES UP BIT-REPRODUCIBILITY ON PURPOSE.
+            # `llvm_ad_rgb` at one thread is the reproducible renderer and it costs 78 s a
+            # frame here, measured on views 0 to 3 of round 1. This loop does not spend that,
+            # because the thing it feeds is EditScore at NF4: a quantised 8B model that
+            # samples its own answer. A bit-exact render into a non-exact scorer buys
+            # nothing. Corpus generation is the other case and keeps llvm.
+            render_view.render(str(mesh), out, view, VIEWS, 40.0, (0.0, 0.0),
+                               spp=128, threads=0, variant="cuda_ad_rgb")
+            rendered.append(str(out))
+            sidecar = json.loads(out.with_suffix(".json").read_text())
+            directions.append((sidecar["yaw_deg"] % 360, sidecar["pitch_deg"]))
+
+        # THE SCORED VIEW IS CHOSEN, AND RETURNING rendered[0] WAS THE BUG. Index 0 is a
+        # camera underneath the body, so three rounds scored 0.0 and the scorer's own words
+        # were that the subject was lying down. The fit solves a weak-perspective camera
+        # facing the subject, so the comparison belongs at a front view at eye level. The
+        # cameras are read back out of the sidecars rather than recomputed, because the
+        # sidecar is what the renderer actually used.
+        index, degrees = nearest_view(directions, 0.0, 0.0)
+        phrase, note = describe_camera(*directions[index])
+        print(f"round {i}: scoring view {index}, {degrees:.1f} deg from a front view, "
+              f"{phrase or note}")
+        return rendered[index]
+
+    return propose
 
 
 def score(path):
+    """EditScore in this interpreter, and a refusal is a failure rather than a zero."""
     out = WORK / (Path(path).stem + ".score.json")
-    pixi_run("editscore", [
-        str(HARNESS / "weft_score.py"),
-        "--source", PHOTO, "--edited", str(path),
-        "--instruction", "match the pose of the person in the source photograph",
-        "--out", str(out), "--precision", "nf4",
-    ])
-    return json.loads(out.read_text())["overall"]
+    record = weft_score.evaluate(
+        PHOTO, path, "match the pose of the person in the source photograph",
+        precision="nf4", out=out,
+    )
+    if record["refused"]:
+        raise PreconditionFailed(f"the scorer refused {path}, so there is no measurement")
+    return record["overall"]
 ```
 
-`--variant llvm_ad_rgb --threads 1` is the reproducible renderer. `metal_ad_rgb` is 60
-times faster and is not bit-reproducible, so it produces nothing a later round can be
-compared against.
+`llvm_ad_rgb --threads 1` is the reproducible renderer, and this loop does not use it.
+Three renders of a scene at a pinned seed on a GPU produced three different sha256 digests,
+so `cuda_ad_rgb` cannot answer "is this frame the frame we rendered last week". This loop
+never asks that. It renders a proposal and hands it to EditScore at NF4, which is a
+quantised model that samples, so the pipeline is already not reproducible frame to frame
+and a reproducible render inside it is a cost with no buyer.
+
+The rule that stands is narrower than "always llvm", then: **a render that enters a corpus
+or a comparison across time is llvm at one thread, and a render consumed immediately by a
+sampling scorer may take the card.** The sidecar still records the variant, the spp and the
+frame hash, so which one produced a given frame is a fact rather than a memory.
 
 The views are the whole `sphere_hammersley_sequence`, all eight, every round. A front view
 picked by hand shows error of five stacked soda cans along the travel axis against three and
@@ -158,31 +268,41 @@ needed.
 ```python
 import numpy as np
 
-from loop1_fit import build_model, bone_names, fit_2d, residuals_by_region, detect_keypoints
-
 model = build_model()
-names = bone_names(model)          # the fullbody 104, ANNY's own labels
-target2d, confidence = detect_keypoints(PHOTO)
-fit = fit_2d(model, target2d, names, confidence)
+fullbody = bone_names(model)       # ANNY's own 104, and the round trip's vocabulary
+regressor, names = coco_regressor(model)   # the 17 a COCO detector actually produces
+
+target2d, confidence, target_names = detect_keypoints(PHOTO)
+if target_names != names:
+    raise ValueError(f"the detector names {target_names} and the regressor names {names}")
+
+fit = fit_2d(model, target2d, names, confidence, regressor=regressor)
 print(f"median {float(np.median(fit['residual_px'])):.2f} px of {fit['stature_px']:.0f} px stature")
+print(f"{len(names)} of {len(fullbody)} points, so both hand regions will read NOT_RUN")
 ```
 
 **Measured, by a known-answer round trip rather than by inspection.** Pose the rig, project
 its own 104 joints through a known camera, throw the pose away and fit it back:
-`priv/python/test_loop1_fit.py` recovers a median of 1.19 px on a 591 px stature, which is
-0.202% of stature, or 3.4 mm on a 1.7 m body -- about two stacked pennies. Shuffled targets
-reach 233 px, so the round trip is measuring the solve rather than the rest pose.
+`priv/python/test_loop1_fit.py` recovers a median of 1.193 px on a 591.1 px stature, which
+is 0.202% of stature, or 3.44 mm on a 1.7 m body -- about two stacked pennies. Shuffled
+targets reach 233.039 px, so the round trip is measuring the solve rather than the rest
+pose. The same test runs the round trip a second time in the 17-point vocabulary, which is
+the one a detector actually gives: 1.555 px, 0.263%, 4.48 mm, about one pencil, against
+111.844 px shuffled. Both were measured in the `anny` environment on 2026-08-25, 60 LBFGS
+iterations on CPU. Two vocabularies, two numbers, and neither one substitutes for the other.
 
 **The fullbody vocabulary fills all five referee regions**, which is what a 17-point set
-never does: 31 body points, 30 feet, 20 per hand and 3 face. An earlier version of this
-notebook subset every target to COCO-17 and then reported that the referee could not run.
-It could not run because 87 of the 104 points were being thrown away.
+never does: 33 body points, 30 feet, 19 per hand and 3 face. That is measured on the round
+trip, where the targets are the rig's own joints. A 17-point target fills body, face and
+feet, and both hands stay NOT_RUN. A wrist counted as a hand until the 17-point control was
+written, and it filled each hand region with that one point, so `region_of` now reads a
+wrist as body and the test fails if either hand fills from 17 points.
 
-**The blocker moved, and it is now smaller.** Nothing here carries `rfdetr`: rf-detr-mcp
-documents a local virtual environment that is not in the checkout, and no pixi environment
-declares it either, so `detect_keypoints` raises. The fit needs none of that. Seventeen
-points from anywhere -- a projection of an authored pose, a hand annotation, another
-detector -- go straight into `fit_2d`.
+**The blocker is closed, and what it hid is now visible.** `rfdetr` is declared in the
+setup cell above, so `detect_keypoints` runs. What it returns is 17 points, not 104, which
+is why the cell below fits through the regressor and says so. Points from anywhere else --
+a projection of an authored pose, a hand annotation, another detector -- still go straight
+into `fit_2d`, and the names decide which forward runs.
 
 ```python
 fit_residuals = residuals_by_region(fit["names"], fit["residual_px"])
@@ -214,6 +334,10 @@ def report(fit_residuals, stature):
     return verdict
 ```
 
+```python
+verdict = report(fit_residuals, stature)
+```
+
 `FITS`, `IMPOSSIBLE`, `HANDS_UNTRUSTED` or `NOT_RUN`. A missing region is `NOT_RUN` and
 never a pass, which is the rule the harness applies to a missing environment as well.
 
@@ -226,10 +350,82 @@ which regions were unavailable rather than averaging over the ones that were.
 ## Run it
 
 ```python
+propose = make_propose(model, target2d, names, confidence, regressor)
 history = run(propose, score, control=PHOTO, rounds=3)
 print(history.table())
 plot(history)
 ```
+
+## What the loop produced
+
+A result that only exists as a file on this desk has not been reported. Each cell below
+returns an image or a table, so the document carries the evidence next to the claim.
+
+```python
+from PIL import Image, ImageDraw
+
+
+def with_keypoints(path, xy, confidence, radius=7):
+    """The detector's 17 points on the input, so the fit's target is visible.
+
+    A confident point is drawn thick and an unconfident one thin, because `fit_2d` weights
+    them that way and a picture that hides the weighting would not show what was fitted.
+    """
+    image = Image.open(path).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    for (x, y), c in zip(xy, confidence):
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius),
+                     outline=(255, 96, 40), width=4 if c >= 0.5 else 1)
+    return image
+
+
+with_keypoints(PHOTO, target2d, confidence)
+```
+
+```python
+def contact_sheet(paths, columns=4, tile=256):
+    """The whole sequence in one image. Eight separate outputs is not a view of a sequence."""
+    tiles = [Image.open(p).convert("RGB").resize((tile, tile)) for p in paths]
+    rows = (len(tiles) + columns - 1) // columns
+    sheet = Image.new("RGB", (columns * tile, rows * tile), (20, 19, 17))
+    for i, image in enumerate(tiles):
+        sheet.paste(image, ((i % columns) * tile, (i // columns) * tile))
+    return sheet
+
+
+last = history.rounds[-1].index
+contact_sheet(sorted(str(p) for p in WORK.glob(f"fit_{last}_view*.png")))
+```
+
+The eight tiles are the `sphere_hammersley_sequence`, in order, pitches -90, -30, 0, 9.6,
+19.5, 30, 41.8 and 56.4 degrees. A front view picked by hand shows error of five stacked
+soda cans along the travel axis against three and a half across it, so the sheet is the
+whole sequence or it is a measurement of the view.
+
+```python
+import json as _json
+
+rows = []
+for round_ in history.rounds:
+    record = _json.loads((WORK / (Path(round_.artifact).stem + ".score.json")).read_text())
+    rows.append({
+        "round": round_.index,
+        "iters": 40 * (round_.index + 1),
+        "score": round_.score,
+        "delta": round_.delta,
+        "seconds": round(round_.seconds, 1),
+        "scorer_seconds": round(record["seconds"], 1),
+        "peak_vram_gib": round(record["peak_vram_gib"], 2) if record["peak_vram_gib"] else None,
+        "refused": record["refused"],
+    })
+print(f"baseline {history.baseline:.3f} on {Path(history.control).name}")
+for row in rows:
+    print("  " + "  ".join(f"{k}={v}" for k, v in row.items()))
+rows
+```
+
+`refused` is in the table on purpose. A refusal is the absence of a measurement, and a
+column that only carried the score would show it as a number.
 
 ## Provenance
 
@@ -241,8 +437,15 @@ record = {
     "rig": {"topology": "makehuman", "vertices": 19158, "keypoint_asset_points": 23},
     "renderer": {"engine": "mitsuba", "variant": "llvm_ad_rgb", "threads": 1,
                  "cameras": "sphere_hammersley_sequence"},
+    # THE TWO NUMBERS WERE NEVER IN CONFLICT, AND CALLING 1.56 STALE WAS THE ERROR.
+    # `test_loop1_fit.py` runs the round trip in both vocabularies: 1.193 px on a 591.1 px
+    # stature, 0.202%, through ANNY's own 104 bone joints, and 1.555 px, 0.263%, through the
+    # 23-point regressor restricted to COCO-17. This cell recorded the second and the prose
+    # recorded the first. Both are here now, each named by the vocabulary it measures, so
+    # the next reader cannot take one for the other.
     "fit": {"solver": "loop1_fit.fit_2d", "camera": "weak perspective",
-            "round_trip_median_px": 1.56, "round_trip_pct_of_stature": 0.263},
+            "fullbody_104": {"round_trip_median_px": 1.193, "pct_of_stature": 0.202},
+            "coco_17": {"round_trip_median_px": 1.555, "pct_of_stature": 0.263}},
     "baseline": history.baseline,
     "rounds": [r.__dict__ for r in history.rounds],
 }
