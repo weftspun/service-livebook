@@ -1,0 +1,40 @@
+# The unit tests run here and the models do not. Every stage in the suite is a Mox mock of
+# `ServiceLivebook.Stage`, so what CI exercises is the loop -- the baseline, the deltas,
+# the early stop, and the four answers a stage can give -- with no card, no pixi
+# environment and no seventeen gigabytes of weights. What the models do is measured on the
+# desk and written down in the logbook; this job would only be pretending.
+name: Checks
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+      - run: mix deps.get
+      - run: mix test
+
+  no-exceptions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+      # The controls first. A gate that cannot fail certifies the defect, and this one has
+      # already been wrong once: it missed `def ... rescue`, which is the way the construct
+      # is usually written.
+      - run: elixir scripts/check_no_exceptions.exs --self-test
+      - run: elixir scripts/check_no_exceptions.exs
