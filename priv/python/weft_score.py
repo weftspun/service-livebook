@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -45,9 +46,14 @@ def main() -> int:
 
     from PIL import Image
 
-    # The NF4 monkeypatch is score_edits.py's, reused rather than copied. It is
-    # importable because that file guards its own main() behind __main__, and this
-    # process runs with the corpus repository as its working directory.
+    # The NF4 monkeypatch is score_edits.py's, reused rather than copied. It is importable
+    # because that file guards its own main() behind __main__.
+    #
+    # The working directory has to be put on the path explicitly. Python seeds sys.path[0]
+    # with the script's own directory, not the caller's, so running this file by absolute
+    # path from the corpus repository left score_edits.py unimportable and the first real
+    # run died on ModuleNotFoundError before loading anything.
+    sys.path.insert(0, os.getcwd())
     if args.precision == "nf4":
         from score_edits import patch_for_4bit
 

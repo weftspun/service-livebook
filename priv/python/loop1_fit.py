@@ -1,84 +1,112 @@
-"""Fit an ANNY pose to 2D keypoints, which is the front end loop 1 was missing.
+"""Fit an ANNY pose to 2D keypoints, for the fullbody vocabulary.
 
-WHAT WAS ACTUALLY MISSING. The notebook said no points-to-pose solver existed, and that was
-wrong. `4-entities/anny-pose-retarget-work/fit_joints_to_anny.py` solves a full 104-bone
-pose from 21 *three-dimensional* joint positions, by Umeyama for the global placement and
-LBFGS with a strong-Wolfe line search for the per-bone rotations. What is missing is only
-the front end: RF-DETR gives 2D pixels, and that file takes 3D world positions.
+WHAT WAS MISSING WAS THE FRONT END, NOT THE SOLVER.
+`4-entities/anny-pose-retarget-work/fit_joints_to_anny.py` solves a full 104-bone pose from
+21 *three-dimensional* joint positions, by Umeyama for the global placement and LBFGS with a
+strong-Wolfe line search for the rotations. This is the same solve driven from pixels.
 
-This is that front end, built the same way and reusing the same two ideas.
+THE VOCABULARY IS THE CALLER'S, AND THE EARLIER VERSION HARDCODED THE WRONG ONE. It defined
+COCO-17 and subset every target to it. `todo.md` names loop one's detector as
+"RFDetr Fullbody Coco Keypoints", and ANNY's own `bone_labels` carries exactly 104 names, so
+a fullbody target has a home and a 17-point subset was throwing 87 of them away. Names now
+arrive with the targets and nothing here asserts a length.
 
-THE FORWARD IS ALREADY DIFFERENTIABLE, so no inverse model is needed and none is licensed.
-`anny.keypoints.KeypointsRegressor` is a per-vertex convex blend from vertices to 23 named
-keypoints, `coco.pth` ships with the package, and everything from pose parameters to those
-keypoints is torch. Composing a camera onto the end gives 2D, and the loss is a
-reprojection distance.
+TWO FORWARDS, CHOSEN BY WHICH VOCABULARY THE NAMES BELONG TO.
 
-THE CAMERA IS WEAK PERSPECTIVE, and the choice is the honest one rather than the convenient
-one. A full perspective camera needs a focal length, which a single uncalibrated photograph
-does not carry; solving for one alongside the pose trades depth against focal length and the
-pair is not separable from silhouette-free 2D points. Weak perspective has three parameters,
-all of which the closed-form initial below solves exactly, so nothing here is optimised that
-can be computed.
+* Bone joints, `bone_poses[0, :, :3, 3]`, indexed by `bone_labels`. This is the fullbody
+  path and the one `fit_joints_to_anny.py` uses.
+* `anny.keypoints.KeypointsRegressor`, a per-vertex convex blend to 23 named keypoints, for
+  a target expressed in those 23. `coco.pth` ships with the package.
+
+Both are differentiable end to end, so composing a camera makes the loss a reprojection
+distance and no inverse model is needed or licensed.
+
+THE CAMERA IS WEAK PERSPECTIVE, and that is the honest choice rather than the convenient
+one. A focal length is not recoverable from one uncalibrated photograph, and solving for it
+alongside depth trades the two against each other. Its three parameters are linear least
+squares, so `solve_camera` computes them rather than descending on them.
 
 WHAT THIS DOES NOT DO. It does not recover depth. Two poses whose keypoints project to the
-same pixels are indistinguishable to this loss, and the classic pair is a limb toward the
+same pixels are indistinguishable to this loss, the classic pair being a limb toward the
 camera against the same limb away from it. `pose-consensus/python/depth_term.py` exists for
-exactly that and is not wired in here. A fit from this file is a 2D-consistent pose, which
-is a smaller claim than a correct one, and the referee's verdict is what says whether the
-body could hold it at all.
+that and is not wired in here. A fit from this file is a 2D-consistent pose, which is a
+smaller claim than a correct one, and the referee says whether a body could hold it.
 """
 from __future__ import annotations
 
 import numpy as np
 import torch
 
-COCO17 = [
-    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
-    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-    "left_wrist", "right_wrist", "left_hip", "right_hip",
-    "left_knee", "right_knee", "left_ankle", "right_ankle",
-]
+# The referee judges five regions. A fullbody vocabulary can fill all five; a 17-point one
+# fills two. Which region a point belongs to is decided by its name, so the mapping is data
+# rather than a chain of conditionals somebody has to keep in step with the rig.
+HAND_MARKERS = ("finger", "thumb", "wrist", "hand", "metacarpal")
+FOOT_MARKERS = ("toe", "foot", "ankle", "heel")
+FACE_MARKERS = ("head", "eye", "ear", "nose", "jaw", "tongue", "lip", "brow", "orbicularis",
+                "temporalis", "levator", "risorius", "mentalis", "buccinator", "zygomatic",
+                "depressor", "special", "oris", "nasalis", "procerus")
 
 
-def build_model():
-    """The 19,158-vertex makehuman topology, because `coco.pth` is indexed against it."""
+def build_model(topology: str = "makehuman"):
+    """The makehuman topology, because `coco.pth` is indexed against its vertex count."""
     import anny
     from anny.models.model_data import TopologyConfig
 
-    model = anny.Anny(
-        topology=TopologyConfig(base_mesh="makehuman", remove_unattached_vertices=False)
+    return anny.Anny(
+        topology=TopologyConfig(base_mesh=topology, remove_unattached_vertices=False)
     )
-    assert model()["vertices"].shape[1] == 19158, "wrong topology; coco.pth expects 19,158"
-    return model
 
 
-def keypoint_names(regressor, fallback=COCO17):
+def bone_names(model) -> list[str]:
+    """ANNY's own 104, asserted against the count rather than assumed."""
+    labels = list(model.bone_labels)
+    if len(labels) != model.bone_count:
+        raise ValueError(f"{len(labels)} labels against {model.bone_count} bones")
+    return labels
+
+
+def regressor_names(regressor, fallback=None) -> list[str]:
     names = getattr(regressor, "labels", None) or getattr(regressor, "names", None)
-    return list(names) if names else list(fallback)
+    return list(names) if names else list(fallback or [])
 
 
-def subset_17(names):
-    """Indices of the COCO-17 inside whatever the regressor emits.
+def subset(available, wanted) -> torch.Tensor:
+    """Indices of `wanted` inside `available`, raising rather than shortening.
 
-    The asset carries 23 -- COCO-17 plus six foot points -- and the detector carries 17.
-    Taking the subset by name is the only version of this that cannot silently misalign,
-    which is why a missing name raises rather than shortening the array.
+    Taking a subset by name is the only version of this that cannot silently misalign. The
+    failure it prevents is an array of one length reaching a consumer of another and being
+    truncated at the tail, which is where the extremities are.
     """
-    index = {n: i for i, n in enumerate(names)}
-    missing = [n for n in COCO17 if n not in index]
+    index = {n: i for i, n in enumerate(available)}
+    missing = [n for n in wanted if n not in index]
     if missing:
-        raise KeyError(f"the keypoint asset is missing {missing}")
-    return torch.tensor([index[n] for n in COCO17], dtype=torch.long)
+        tail = f" and {len(missing) - 6} more" if len(missing) > 6 else ""
+        raise KeyError(f"the forward has no keypoint named {missing[:6]}{tail}")
+    return torch.tensor([index[n] for n in wanted], dtype=torch.long)
+
+
+def region_of(name: str) -> str:
+    """Which referee region a keypoint name belongs to. Body is the default, not a guess."""
+    lower = name.lower()
+    if any(marker in lower for marker in HAND_MARKERS):
+        if lower.endswith(".l") or "left" in lower:
+            return "left_hand"
+        if lower.endswith(".r") or "right" in lower:
+            return "right_hand"
+        return "body"
+    if any(marker in lower for marker in FOOT_MARKERS):
+        return "feet"
+    if any(marker in lower for marker in FACE_MARKERS):
+        return "face"
+    return "body"
 
 
 def solve_camera(points3d, target2d, weights):
-    """Closed form for weak perspective: scale and a 2D translation, exactly.
+    """Closed form for weak perspective: one scale and a 2D translation, exactly.
 
-    Minimising sum w * ||s * xy + t - target||^2 over (s, tx, ty) is linear least squares,
-    so it is solved rather than descended on. This is the same reasoning `fit_one` gives for
-    starting from Umeyama: the global placement is not what a line search should spend
-    itself on.
+    Minimising sum w * ||s * xy + t - target||^2 over (s, tx, ty) is linear least squares.
+    This is `fit_one`'s reasoning for starting from Umeyama: the global placement is not what
+    a line search should spend itself on.
     """
     xy = points3d[:, :2]
     w = weights[:, None]
@@ -89,38 +117,43 @@ def solve_camera(points3d, target2d, weights):
     return scale, tm - scale * xm
 
 
-def fit_2d(model, regressor, target2d, confidence=None, iters=120, dtype=torch.float64,
-           prior=1e-5):
-    """Solve pose parameters whose projected COCO-17 keypoints match `target2d`.
+def fit_2d(model, target2d, names, confidence=None, regressor=None, iters=120,
+           dtype=torch.float64, prior=1e-5):
+    """Solve pose parameters whose projected keypoints match `target2d`.
 
-    `target2d` is (17, 2) in pixels, in the COCO-17 order above. `confidence` is (17,) and
-    weights each point; a keypoint the detector was unsure of should not drag a limb.
+    `names` is the vocabulary of the targets, in their row order: ANNY bone labels for a
+    fullbody target, or the regressor's own names when `regressor` is given. `target2d` is
+    (N, 2) in pixels and `confidence` is (N,), weighting each point so that one the detector
+    was unsure of does not drag a limb.
 
-    Returns a dict carrying the pose, the fitted 2D keypoints, per-keypoint pixel residuals,
-    the fitted stature in the same pixels, and the camera. Residual and stature share units,
-    so the referee's fraction-of-stature thresholds apply unchanged.
+    Returns the pose, the fitted 2D keypoints, per-keypoint pixel residuals, the fitted
+    stature in those same pixels, and the camera. Residual and stature share units, so the
+    referee's fraction-of-stature thresholds apply unchanged.
     """
+    import roma
+
     target2d = torch.as_tensor(target2d, dtype=dtype)
-    if target2d.shape != (17, 2):
-        raise ValueError(f"target2d is {tuple(target2d.shape)}, and must be (17, 2)")
-    weights = (torch.ones(17, dtype=dtype) if confidence is None
+    if target2d.ndim != 2 or target2d.shape[1] != 2:
+        raise ValueError(f"target2d is {tuple(target2d.shape)}, and must be (N, 2)")
+    if len(names) != target2d.shape[0]:
+        raise ValueError(f"{len(names)} names against {target2d.shape[0]} target rows")
+    weights = (torch.ones(len(names), dtype=dtype) if confidence is None
                else torch.as_tensor(confidence, dtype=dtype).clamp_min(0.0))
     if float(weights.sum()) <= 0:
         raise ValueError("every keypoint has zero confidence, so there is nothing to fit")
 
     n = model.bone_count
-    names = keypoint_names(regressor)
-    idx = subset_17(names)
+    available = bone_names(model) if regressor is None else regressor_names(regressor)
+    idx = subset(available, list(names))
 
     rotvec = torch.zeros(n, 3, dtype=dtype, requires_grad=True)
 
     def keypoints3d():
         pose = torch.eye(4, dtype=dtype)[None, None].repeat(1, n, 1, 1).clone()
-        import roma
-
         pose[0, :, :3, :3] = roma.rotvec_to_rotmat(rotvec)
         out = model(pose_parameters=pose)
-        return regressor(out)[0].to(dtype)[idx]
+        points = out["bone_poses"][0, :, :3, 3] if regressor is None else regressor(out)[0]
+        return points.to(dtype)[idx]
 
     with torch.no_grad():
         scale0, t0 = solve_camera(keypoints3d(), target2d, weights)
@@ -136,8 +169,8 @@ def fit_2d(model, regressor, target2d, confidence=None, iters=120, dtype=torch.f
 
     def closure():
         opt.zero_grad()
-        # The rest prior is `fit_one`'s, for its reason: most of the 104 bones move no
-        # keypoint at all and would otherwise be free to fold anywhere.
+        # The rest prior is `fit_one`'s, for its reason: a bone that moves no target point is
+        # otherwise free to fold anywhere.
         loss = (weights[:, None] * (projected() - target2d) ** 2).sum() + prior * (rotvec ** 2).sum()
         loss.backward()
         return loss
@@ -145,8 +178,6 @@ def fit_2d(model, regressor, target2d, confidence=None, iters=120, dtype=torch.f
     opt.step(closure)
 
     with torch.no_grad():
-        import roma
-
         pose = torch.eye(4, dtype=dtype)[None, None].repeat(1, n, 1, 1).clone()
         pose[0, :, :3, :3] = roma.rotvec_to_rotmat(rotvec)
         out = model(pose_parameters=pose)
@@ -158,6 +189,7 @@ def fit_2d(model, regressor, target2d, confidence=None, iters=120, dtype=torch.f
     return {
         "pose": pose.detach(),
         "rotvec": rotvec.detach(),
+        "names": list(names),
         "keypoints2d": fitted,
         "residual_px": residual,
         "stature_px": stature,
@@ -165,32 +197,27 @@ def fit_2d(model, regressor, target2d, confidence=None, iters=120, dtype=torch.f
     }
 
 
-def residuals_by_region(residual_px):
-    """The two regions a 17-point detector can fill, named rather than assumed.
+def residuals_by_region(names, residual_px) -> dict:
+    """Group residuals into the referee's regions, filling only what the names support.
 
-    Face and both hands stay absent, so the referee returns NOT_RUN. That is the correct
-    answer for a 17-point fit and the reason a wholebody head is wanted, not a defect in
-    this file.
+    A region with no keypoints is absent rather than empty, because the referee treats a
+    missing region as NOT_RUN and an empty array would be a measurement of nothing. Which
+    regions a vocabulary can fill is a property of the vocabulary: the fullbody 104 reach the
+    face and both hands, and a 17-point set never does.
     """
-    ankle = [COCO17.index(n) for n in COCO17 if n.endswith("ankle")]
-    body = [i for i in range(17) if i not in ankle]
-    return {
-        "body": residual_px[body].numpy(),
-        "feet": residual_px[ankle].numpy(),
-    }
+    grouped: dict[str, list[float]] = {}
+    for name, value in zip(names, np.asarray(residual_px)):
+        grouped.setdefault(region_of(name), []).append(float(value))
+    return {region: np.asarray(values) for region, values in grouped.items()}
 
 
 def detect_keypoints(image_path, threshold: float = 0.4):
-    """RF-DETR's 17 keypoints for one image, or a refusal naming what is absent.
+    """The fullbody detector's keypoints for one image, or a refusal naming what is absent.
 
-    THIS IS THE BLOCKER NOW, AND IT IS SMALLER THAN THE ONE IT REPLACED. The fit above is
-    measured and works; what has no home is the detector. `rf-detr-mcp` documents
-    `uv pip install rfdetr` into a local virtual environment, that environment is not in the
-    checkout, and no `pixi` environment in the corpus repository declares `rfdetr` either.
-    So the loop can fit any 17 points it is given and cannot yet read them off a photograph.
-
-    Passing keypoints in from anywhere else -- a projection of an authored pose, a hand
-    annotation, another detector -- needs none of this.
+    Nothing checked out here carries `rfdetr`: rf-detr-mcp documents a local virtual
+    environment that is not in the checkout, and no pixi environment in the corpus repository
+    declares it. The fit needs none of this. Points from anywhere else -- a projection of an
+    authored pose, a hand annotation, another detector -- go straight into `fit_2d`.
     """
     from weft_loop import PreconditionFailed
 
