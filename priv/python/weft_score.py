@@ -22,6 +22,9 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
+
+CORPUS = Path(r"C:\weftspun-keypoint\6-datasource\anny-render-corpus")
 
 BASE = "Qwen/Qwen3-VL-8B-Instruct"
 ADAPTER = "EditScore/EditScore-Qwen3-VL-8B-Instruct"
@@ -34,42 +37,52 @@ def cap(image, max_pixels: int):
     return image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", required=True)
-    parser.add_argument("--edited", required=True)
-    parser.add_argument("--instruction", required=True)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--precision", choices=["nf4", "bf16"], default="nf4")
-    parser.add_argument("--max-pixels", type=int, default=262144)
-    args = parser.parse_args()
+_SCORER = {}
 
-    from PIL import Image
+
+def scorer(precision: str = "nf4"):
+    """The loaded EditScore, built once per interpreter and kept.
+
+    A notebook scores a render each round, and reloading an 8B backbone every round would
+    make the loop measure the loader. The cache is keyed by precision because the two are
+    different models on the card.
+    """
+    if precision in _SCORER:
+        return _SCORER[precision]
 
     # The NF4 monkeypatch is score_edits.py's, reused rather than copied. It is importable
-    # because that file guards its own main() behind __main__.
-    #
-    # The working directory has to be put on the path explicitly. Python seeds sys.path[0]
-    # with the script's own directory, not the caller's, so running this file by absolute
-    # path from the corpus repository left score_edits.py unimportable and the first real
-    # run died on ModuleNotFoundError before loading anything.
-    sys.path.insert(0, os.getcwd())
-    if args.precision == "nf4":
+    # because that file guards its own main() behind __main__. The corpus directory has to
+    # be on the path explicitly: Python seeds sys.path[0] with this file's directory, not
+    # the caller's, and score_edits.py lives beside the corpus scripts.
+    if str(CORPUS) not in sys.path:
+        sys.path.insert(0, str(CORPUS))
+    if precision == "nf4":
         from score_edits import patch_for_4bit
 
         patch_for_4bit()
 
     from editscore import EditScore
 
-    scorer = EditScore(
+    _SCORER[precision] = EditScore(
         backbone="qwen3vl", model_name_or_path=BASE, lora_path=ADAPTER, score_range=25
     )
+    return _SCORER[precision]
 
-    source = cap(Image.open(args.source).convert("RGB"), args.max_pixels)
-    edited = cap(Image.open(args.edited).convert("RGB"), args.max_pixels)
+
+def evaluate(source_path, edited_path, instruction, precision: str = "nf4",
+             max_pixels: int = 262144, out=None) -> dict:
+    """Score one edit and return the record, writing it beside the image when asked.
+
+    This is the function the notebook calls. `main` below is the same thing behind an
+    argument parser, so the command line and the notebook cannot drift apart.
+    """
+    from PIL import Image
+
+    source = cap(Image.open(source_path).convert("RGB"), max_pixels)
+    edited = cap(Image.open(edited_path).convert("RGB"), max_pixels)
 
     started = time.monotonic()
-    raw = scorer.evaluate([source, edited], args.instruction)
+    raw = scorer(precision).evaluate([source, edited], instruction)
     seconds = time.monotonic() - started
 
     overall = raw.get("overall") if isinstance(raw, dict) else None
@@ -84,21 +97,39 @@ def main() -> int:
         pass
 
     result = {
-        "source": args.source,
-        "edited": args.edited,
-        "instruction": args.instruction,
+        "source": str(source_path),
+        "edited": str(edited_path),
+        "instruction": instruction,
         "base": BASE,
         "adapter": ADAPTER,
-        "precision": args.precision,
-        "max_pixels": args.max_pixels,
+        "precision": precision,
+        "max_pixels": max_pixels,
         "overall": overall,
         "refused": refused,
         "seconds": seconds,
         "peak_vram_gib": peak,
-        "raw": {k: v for k, v in (raw or {}).items() if k != "raw"} if isinstance(raw, dict) else str(raw)[:400],
+        "raw": ({k: v for k, v in (raw or {}).items() if k != "raw"}
+                if isinstance(raw, dict) else str(raw)[:400]),
     }
-    with open(args.out, "w", encoding="utf-8") as handle:
-        json.dump(result, handle, indent=2)
+    if out is not None:
+        with open(out, "w", encoding="utf-8") as handle:
+            json.dump(result, handle, indent=2)
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--edited", required=True)
+    parser.add_argument("--instruction", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--precision", choices=["nf4", "bf16"], default="nf4")
+    parser.add_argument("--max-pixels", type=int, default=262144)
+    args = parser.parse_args()
+
+    result = evaluate(args.source, args.edited, args.instruction,
+                      precision=args.precision, max_pixels=args.max_pixels, out=args.out)
+    overall, refused, peak = result["overall"], result["refused"], result["peak_vram_gib"]
 
     # A refusal is reported as a failure rather than as a zero, because a zero would enter
     # the history as a measurement and a refusal is the absence of one.

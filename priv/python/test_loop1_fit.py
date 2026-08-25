@@ -25,7 +25,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from loop1_fit import bone_names, build_model, fit_2d, region_of, residuals_by_region, subset
+from loop1_fit import (COCO17, bone_names, build_model, coco_regressor, fit_2d, image_axes,
+                       region_of, residuals_by_region, subset, to_image)
 
 FAILS: list[str] = []
 ITERS = 60
@@ -69,10 +70,13 @@ def main() -> int:
         out = model(pose_parameters=pose)
         joints = out["bone_poses"][0, :, :3, 3].to(torch.float64)
         verts = out["vertices"][0].to(torch.float64)
-        true_stature = float(verts[:, 1].max() - verts[:, 1].min())
+        true_stature = float(verts[:, image_axes(model)[1]].max()
+                             - verts[:, image_axes(model)[1]].min())
 
+    axes = image_axes(model)
+    print(f"image axes measured off the rest pose: right={axes[0]}, up={axes[1]}")
     scale, translation = 900.0, torch.tensor([512.0, 384.0], dtype=torch.float64)
-    target = joints[:, :2] * scale + translation
+    target = to_image(joints, axes) * scale + translation
     target_stature = true_stature * scale
 
     print("known-answer round trip: fit the projection of a pose the rig can hold")
@@ -125,6 +129,94 @@ def main() -> int:
     if all(w in regions for w in ("body", "feet", "face", "left_hand", "right_hand")):
         print("  ok  all five referee regions are filled, which a 17-point set never does")
 
+    print("the detector vocabulary, which is 17 and not 104")
+    regressor, coco_names = coco_regressor(model)
+    if coco_names != list(COCO17):
+        FAILS.append("coco label order")
+        print(f"  BAD coco.pth's first 17 labels are {coco_names}")
+    else:
+        print(f"  ok  coco.pth's first 17 labels are COCO's order, {coco_names[0]} to {coco_names[-1]}")
+
+    # The same round trip in the 17-point vocabulary, because that is what a detector gives
+    # and the fullbody number above says nothing about it.
+    with torch.no_grad():
+        kp17 = regressor(model(pose_parameters=pose))[0].to(torch.float64)
+    kp17 = kp17[subset(regressor.labels, coco_names)]
+    target17 = to_image(kp17, axes) * scale + translation
+    fit17 = fit_2d(model, target17, coco_names, regressor=regressor, iters=ITERS)
+    median17 = float(np.median(fit17["residual_px"].numpy()))
+    fraction17 = median17 / target_stature
+    mm17 = fraction17 * 1700.0
+    print(f"  17-point round trip: median {median17:.3f} px, {100 * fraction17:.3f}% of stature")
+    print(f"  on a 1.7 m body that is {mm17:.2f} mm, {household(mm17)}")
+    if fraction17 >= 0.02:
+        FAILS.append("17-point round trip")
+        print("  BAD the 17-point round trip is outside the referee's 2% of stature")
+    else:
+        print("  ok  the 17-point round trip is inside the referee's 2% of stature")
+
+    shuffled17 = target17[torch.randperm(17, generator=torch.Generator().manual_seed(11))]
+    scrambled17 = float(np.median(
+        fit_2d(model, shuffled17, coco_names, regressor=regressor,
+               iters=ITERS)["residual_px"].numpy()))
+    if scrambled17 <= median17 * 5:
+        FAILS.append("shuffled 17-point targets")
+        print(f"  BAD shuffled 17-point targets fit as well as the real ones ({scrambled17:.3f} px)")
+    else:
+        print(f"  ok  shuffled 17-point targets do not fit: {scrambled17:.3f} px")
+
+    regions17 = residuals_by_region(coco_names, fit17["residual_px"])
+    print(f"  regions a 17-point target fills: {sorted(regions17)}")
+    for absent in ("left_hand", "right_hand"):
+        if absent in regions17:
+            FAILS.append(f"region {absent} from 17 points")
+            print(f"  BAD a 17-point target filled {absent}, which it cannot")
+    if not any(r in regions17 for r in ("left_hand", "right_hand")):
+        print("  ok  both hands stay NOT_RUN, which is the honest verdict for 17 points")
+
+
+    print("sidedness, because a left-right swap fits the pixels just as well")
+    with torch.no_grad():
+        rest = model()
+        kp_rest = regressor(rest)[0].to(torch.float64).numpy()
+        joints_rest = rest["bone_poses"][0, :, :3, 3].to(torch.float64).numpy()
+    ix = {nm: i for i, nm in enumerate(names)}
+    up = np.array([0.0, 0.0, 1.0])
+    shoulder = joints_rest[ix["shoulder01.R"]] - joints_rest[ix["shoulder01.L"]]
+    forward = np.cross(up, shoulder)
+    forward = forward / np.linalg.norm(forward)
+    right_axis = np.cross(forward, up)
+
+    def side_errors(labels_in_order):
+        """Names whose side does not match the side of the body the point sits on."""
+        wrong = []
+        for i, nm in enumerate(labels_in_order):
+            if not nm.startswith(("left_", "right_")):
+                continue
+            d = float(kp_rest[i] @ right_axis)
+            if (d > 0) != nm.startswith("right_"):
+                wrong.append(nm)
+        return wrong
+
+    sided = [nm for nm in regressor.labels if nm.startswith(("left_", "right_"))]
+    wrong = side_errors(list(regressor.labels))
+    if wrong:
+        FAILS.append("sidedness")
+        print(f"  BAD {len(wrong)} of {len(sided)} keypoints are on the wrong side: {wrong[:4]}")
+    else:
+        print(f"  ok  all {len(sided)} sided keypoints sit on the side their name claims")
+
+    # THE NEGATIVE CONTROL IS THE SWAP ITSELF. Exchanging left_ and right_ in the label list
+    # is what a mis-specified mapping does, and nothing else in this file would catch it: a
+    # swapped fit reprojects onto the same pixels and reports the same residual.
+    swapped = [nm.replace("left_", "TMP_").replace("right_", "left_").replace("TMP_", "right_")
+               for nm in regressor.labels]
+    if side_errors(swapped):
+        print(f"  ok  a left-right swap is rejected: "
+              f"{len(side_errors(swapped))} land on the wrong side")
+    else:
+        FAILS.append("sidedness negative control")
+        print("  BAD a left-right swap was accepted, so this check certifies the defect")
     print(f"\n{len(FAILS)} failed")
     return 1 if FAILS else 0
 
