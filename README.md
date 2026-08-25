@@ -65,3 +65,28 @@ The container can reach the card (`docker run --gpus all`, verified), but the
 notebooks reach their models through the `pixi` environments in
 `6-datasource/anny-render-corpus`, which are on the desk. Until that repository
 is bind-mounted, the GPU notebooks run under the first command above.
+
+## The four loops
+
+`notebooks/` holds four loop notebooks, and `LIVEBOOK_HOME` points at that
+directory, so they are on the home screen when the server starts.
+
+    1-keypoints-to-anny.livemd      8 sections, 7 python cells
+    2-image-to-omnigen2.livemd      7 sections, 7 python cells
+    3-stylized-to-omnigen2.livemd   5 sections, 4 python cells
+    4-latent-to-pixal3d.livemd     10 sections, 8 python cells
+
+All four import through `Livebook.LiveMarkdown.Import` with zero warnings, and
+each carries two setup cells: the `Mix.install` cell and the `pyproject.toml`
+cell that pins the Python packages.
+
+**One annotation does not take, and it fails silently.** Each notebook opens with
+`<!-- livebook:{"default_language":"python"} -->`. Livebook 0.19.9's importer
+accepts only `"elixir"` and `"erlang"` there (`live_markdown/import.ex:433`),
+while the notebook struct's own type already allows `:python`. The value is
+dropped without a warning, so `default_language` reads back as `elixir`.
+
+The cost is small and worth stating rather than discovering: the Python cells
+still run as Python, because a cell carries its own language. What is lost is the
+default for a cell you add yourself, which starts as Elixir. The annotation stays
+because it states the intent and will take when upstream widens that list.
