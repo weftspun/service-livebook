@@ -1,0 +1,219 @@
+<!-- livebook:{"default_language":"python"} -->
+
+# Loop 4: 3D latent, EditScore, VoxHammer or OmniGen2
+
+```elixir
+Mix.install([
+  {:pythonx, "~> 0.4.9"},
+  {:kino_pythonx, "~> 0.1.0"},
+  {:kino, "~> 0.19.0"}
+])
+```
+
+```pyproject.toml
+[project]
+name = "weft_loop_notebook"
+version = "0.0.0"
+requires-python = "==3.11.*"
+dependencies = [
+  "pillow==11.1.0",
+  "numpy==2.2.3",
+  "matplotlib==3.10.1",
+  "requests==2.32.3"
+]
+```
+
+## What this loop is
+
+Pixal3D turns an image into a latent and a set of views. Every view is scored against the
+image that conditioned it. What the scores say decides which repair runs, and there are
+two: edit the latent with VoxHammer, or edit a view in 2D with OmniGen2 and re-enter
+Pixal3D.
+
+## The router is the point
+
+A shape that is wrong along one axis scores well from the view that hides it. So the
+decision is not made on one number:
+
+| what the scores look like | what it means | which arm |
+| ------------------------- | ------------- | --------- |
+| low mean, low variance across views | the geometry is agreed on and the appearance is wrong | OmniGen2 on a view, then re-enter |
+| high variance across views | the views disagree about the shape | VoxHammer on the latent |
+
+That is the whole reason the views come from `sphere_hammersley_sequence` rather than from
+a front view somebody picked. One view cannot separate these two cases, and a hand-picked
+front view is the case where the axis error hides.
+
+## One arm does not work yet, and the notebook says so
+
+VoxHammer's server solves and dispatches its seven-step plan and raises
+`NotImplementedError` on every step outside `WEFTSPUN_STUB=1`. It also takes a mesh rather
+than Pixal3D's latent, so the arm passes through `/extract` first, which is a second
+reason it is not a latent edit today.
+
+The router still selects it when the scores say geometry. It reports that it selected an
+arm that cannot run rather than quietly falling through to the other one, because a silent
+fallback would make a geometry failure look like an appearance failure that was repaired.
+
+## Setup
+
+```python
+import sys, json, base64, statistics, requests
+from pathlib import Path
+
+HARNESS = Path(r"C:\weftspun-keypoint\7-service\service-livebook\priv\python")
+CORPUS = Path(r"C:\weftspun-keypoint\6-datasource\anny-render-corpus")
+sys.path.insert(0, str(HARNESS))
+from weft_loop import run, pixi_run, plot, PreconditionFailed
+
+PIXAL3D = "http://localhost:8002"
+VOXHAMMER = "http://localhost:8003"
+WORK = Path(r"C:\weftspun-keypoint\.loop4")
+WORK.mkdir(exist_ok=True)
+
+SOURCE = r"C:\anny_test\hv_0.png"
+INSTRUCTION = "a textured mesh matching the figure in the source image"
+NVIEWS = 8
+VARIANCE_SELECTS_LATENT = 0.15
+```
+
+## Propose: a latent and its views
+
+```python
+def generate(image_path, seed=42):
+    payload = {"image": base64.b64encode(Path(image_path).read_bytes()).decode(),
+               "seed": seed, "nviews": NVIEWS, "view_resolution": 512}
+    response = requests.post(f"{PIXAL3D}/predict", json=payload, timeout=1800)
+    response.raise_for_status()
+    body = response.json()
+    views = []
+    for i, view in enumerate(body["views"]):
+        path = WORK / f"view_{i}.png"
+        path.write_bytes(base64.b64decode(view))
+        views.append(str(path))
+    (WORK / "state.b64").write_text(body["state"], encoding="ascii")
+    return body["state"], views
+```
+
+`/extract` is not called here. Turning the latent into a mesh and a texture is deferred
+until a score clears its target, because extraction is the expensive half and a shape
+nobody has scored is not worth decimating.
+
+## Score every view, not the best one
+
+```python
+def score_view(path):
+    out = WORK / (Path(path).stem + ".score.json")
+    pixi_run("editscore", [
+        str(HARNESS / "weft_score.py"),
+        "--source", SOURCE, "--edited", str(path),
+        "--instruction", INSTRUCTION, "--out", str(out), "--precision", "nf4",
+    ])
+    return json.loads(out.read_text())["overall"]
+
+
+def score_all(views):
+    scores = [score_view(v) for v in views]
+    return {"scores": scores,
+            "mean": statistics.fmean(scores),
+            "variance": statistics.pvariance(scores)}
+```
+
+## The router
+
+```python
+def choose_arm(summary):
+    if summary["variance"] >= VARIANCE_SELECTS_LATENT:
+        return "voxhammer", "the views disagree about the shape"
+    return "omnigen2", "the views agree and the appearance is wrong"
+
+
+def repair_voxhammer(state_b64, region_b64, seed=42):
+    payload = {"mesh": state_b64, "reference":
+               base64.b64encode(Path(SOURCE).read_bytes()).decode(),
+               "region": region_b64, "seed": seed}
+    response = requests.post(f"{VOXHAMMER}/predict", json=payload, timeout=1800)
+    if response.status_code == 500:
+        raise PreconditionFailed(
+            "VoxHammer's edit steps are not wired up. The router selected the latent arm, "
+            "and it cannot run. This is reported rather than swapped for the 2D arm, "
+            "because that swap would make a geometry failure look repaired."
+        )
+    response.raise_for_status()
+    return response.json()
+
+
+def repair_omnigen2(view_path, i):
+    out = WORK / f"repaired_{i}.png"
+    pixi_run("omnigen2", [
+        str(CORPUS / "omnigen2_edit.py"),
+        "--image", str(view_path), "--out", str(out),
+        "--steps", "40", "--precision", "bf16",
+    ])
+    return str(out)
+```
+
+## Run it
+
+```python
+state, views = generate(SOURCE)
+summary = score_all(views)
+arm, why = choose_arm(summary)
+
+print(f"mean {summary['mean']:.3f}  variance {summary['variance']:.4f}")
+print(f"router selects {arm}: {why}")
+for i, s in enumerate(summary["scores"]):
+    print(f"  view {i}  {s:.3f}")
+```
+
+```python
+if arm == "voxhammer":
+    result = repair_voxhammer(state, region_b64)
+else:
+    worst = summary["scores"].index(min(summary["scores"]))
+    repaired = repair_omnigen2(views[worst], worst)
+    state, views = generate(repaired)
+    summary = score_all(views)
+    print(f"after repair: mean {summary['mean']:.3f}  variance {summary['variance']:.4f}")
+```
+
+## Extract, once the score earns it
+
+```python
+def extract(state_b64, decimation_target=20000, texture_size=2048):
+    response = requests.post(f"{PIXAL3D}/extract", json={
+        "state": state_b64, "decimation_target": decimation_target,
+        "texture_size": texture_size}, timeout=1800)
+    response.raise_for_status()
+    body = response.json()
+    (WORK / "mesh.glb").write_bytes(base64.b64decode(body["glb"]))
+    (WORK / "mesh.usda").write_bytes(base64.b64decode(body["layer"]))
+    return WORK / "mesh.glb", WORK / "mesh.usda"
+```
+
+The USD layer names the GLB as an asset path rather than referencing it, and the GLB
+carries pure data: skin weights, animation samplers, morph targets. No runtime modifiers,
+drivers, constraints or custom extensions, because an export that only looks right when
+the consumer runs our code is not portable.
+
+## Provenance
+
+```python
+record = {
+    "loop": "4-latent-to-pixal3d",
+    "source": SOURCE,
+    "generator": {"service": "pixal3d-image-to-textured-mesh", "nviews": NVIEWS,
+                  "view_resolution": 512, "seed": 42},
+    "cameras": "sphere_hammersley_sequence",
+    "scorer": {"base": "Qwen/Qwen3-VL-8B-Instruct",
+               "adapter": "EditScore/EditScore-Qwen3-VL-8B-Instruct", "precision": "nf4"},
+    "view_scores": summary["scores"],
+    "mean": summary["mean"],
+    "variance": summary["variance"],
+    "arm": arm,
+    "arm_reason": why,
+    "voxhammer_state": "stub, edit steps not wired",
+}
+(WORK / "provenance.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+print("wrote", WORK / "provenance.json")
+```

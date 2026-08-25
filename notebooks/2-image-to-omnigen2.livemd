@@ -1,0 +1,158 @@
+<!-- livebook:{"default_language":"python"} -->
+
+# Loop 2: image, EditScore, OmniGen2
+
+```elixir
+Mix.install([
+  {:pythonx, "~> 0.4.9"},
+  {:kino_pythonx, "~> 0.1.0"},
+  {:kino, "~> 0.19.0"}
+])
+```
+
+```pyproject.toml
+[project]
+name = "weft_loop_notebook"
+version = "0.0.0"
+requires-python = "==3.11.*"
+dependencies = [
+  "pillow==11.1.0",
+  "numpy==2.2.3",
+  "matplotlib==3.10.1",
+  "requests==2.32.3"
+]
+```
+
+## What this loop is
+
+Propose an edit with OmniGen2, score it with EditScore against the image that went in,
+change one knob, run it again. Three rounds and a baseline.
+
+The pins above are light on purpose. OmniGen2 needs `torch==2.6.0+cu124` and EditScore
+needs `cu128`, and one embedded interpreter cannot hold two CUDA torch builds, so the two
+heavy stages run in the `pixi` environments that `anny-render-corpus/pixi.toml` already
+declares. This notebook's interpreter holds the loop, the plot and the provenance record.
+
+## The harness
+
+```python
+import sys, json, subprocess
+from pathlib import Path
+
+HARNESS = Path(r"C:\weftspun-keypoint\7-service\service-livebook\priv\python")
+CORPUS = Path(r"C:\weftspun-keypoint\6-datasource\anny-render-corpus")
+sys.path.insert(0, str(HARNESS))
+
+from weft_loop import run, pixi_run, plot, household, PreconditionFailed
+print("harness loaded from", HARNESS)
+```
+
+## Inputs
+
+```python
+SOURCE = r"C:\anny_test\hv_0.png"
+INSTRUCTION = "make the figure photographic, keep the pose exactly"
+WORK = Path(r"C:\weftspun-keypoint\.loop2")
+WORK.mkdir(exist_ok=True)
+
+STEPS = [30, 40, 50]
+CONTROL = SOURCE
+```
+
+`CONTROL` is what the baseline is measured on: the source scored against itself. A score
+with nothing to compare it to is not a measurement, so the harness refuses to return a
+history without one.
+
+## Propose and score
+
+```python
+def propose(i):
+    out = WORK / f"round_{i}.png"
+    pixi_run("omnigen2", [
+        str(CORPUS / "omnigen2_edit.py"),
+        "--image", SOURCE,
+        "--out", str(out),
+        "--steps", str(STEPS[i - 1]),
+        "--precision", "bf16",
+    ])
+    return str(out)
+
+
+def score(path):
+    out = WORK / (Path(path).stem + ".score.json")
+    pixi_run("editscore", [
+        str(HARNESS / "weft_score.py"),
+        "--source", SOURCE,
+        "--edited", str(path),
+        "--instruction", INSTRUCTION,
+        "--out", str(out),
+        "--precision", "nf4",
+        "--max-pixels", "262144",
+    ])
+    return json.loads(out.read_text())["overall"]
+```
+
+`--precision bf16` on the generator and `nf4` on the scorer is not an inconsistency. A
+quantised generator does not produce corpus data; a quantised verifier is permitted, and
+EditScore at NF4 peaks at 6.75 GiB against 8.60 GiB at 1024, which is why the pixel cap
+is here at all.
+
+## Run it
+
+```python
+history = run(propose, score, control=CONTROL, rounds=3)
+print(history.table())
+```
+
+```python
+plot(history)
+```
+
+## The control that must fail
+
+```python
+def score_wrong(path):
+    out = WORK / (Path(path).stem + ".wrong.json")
+    pixi_run("editscore", [
+        str(HARNESS / "weft_score.py"),
+        "--source", SOURCE,
+        "--edited", str(path),
+        "--instruction", "turn the figure into a bowl of soup",
+        "--out", str(out),
+        "--precision", "nf4",
+    ])
+    return json.loads(out.read_text())["overall"]
+
+
+control_score = score_wrong(history.best.artifact)
+print("wrong instruction:", control_score, "| best:", history.best.score)
+assert control_score < history.best.score, "the scorer did not separate a wrong instruction from a right one"
+```
+
+A check that passes on known-broken input certifies the defect. This one asserts that the
+scorer can tell a matching instruction from a nonsense one; if it cannot, nothing above it
+means anything.
+
+## Provenance
+
+```python
+record = {
+    "loop": "2-image-to-omnigen2",
+    "source": SOURCE,
+    "instruction": INSTRUCTION,
+    "generator": {"model": "OmniGen2/OmniGen2", "precision": "bf16", "steps": STEPS},
+    "scorer": {"base": "Qwen/Qwen3-VL-8B-Instruct",
+               "adapter": "EditScore/EditScore-Qwen3-VL-8B-Instruct",
+               "precision": "nf4", "max_pixels": 262144},
+    "baseline": history.baseline,
+    "rounds": [r.__dict__ for r in history.rounds],
+    "wrong_instruction_control": control_score,
+}
+path = history.to_json(WORK / "history.json")
+(WORK / "provenance.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+print("wrote", path)
+```
+
+Generated data carries its generator, checkpoint and conditioning, or it cannot be
+regenerated and its provenance cannot be answered later. That is condition 1, and this
+cell is where the loop satisfies it.

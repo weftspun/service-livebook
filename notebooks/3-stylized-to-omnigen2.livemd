@@ -1,0 +1,133 @@
+<!-- livebook:{"default_language":"python"} -->
+
+# Loop 3: stylized image, EditScore, OmniGen2
+
+```elixir
+Mix.install([
+  {:pythonx, "~> 0.4.9"},
+  {:kino_pythonx, "~> 0.1.0"},
+  {:kino, "~> 0.19.0"}
+])
+```
+
+```pyproject.toml
+[project]
+name = "weft_loop_notebook"
+version = "0.0.0"
+requires-python = "==3.11.*"
+dependencies = [
+  "pillow==11.1.0",
+  "numpy==2.2.3",
+  "matplotlib==3.10.1",
+  "requests==2.32.3"
+]
+```
+
+## What this loop is
+
+Loop 2 with a style transfer in front of it. CycleGAN restyles the image, OmniGen2 edits
+the restyled version, and EditScore grades the edit against the restyled source rather
+than against the original. Grading against the original would score the style transfer
+and the edit together and report the sum as one number.
+
+## Setup
+
+```python
+import sys, json, base64, requests
+from pathlib import Path
+
+HARNESS = Path(r"C:\weftspun-keypoint\7-service\service-livebook\priv\python")
+CORPUS = Path(r"C:\weftspun-keypoint\6-datasource\anny-render-corpus")
+sys.path.insert(0, str(HARNESS))
+from weft_loop import run, pixi_run, plot
+
+CYCLEGAN = "http://localhost:8000"
+WORK = Path(r"C:\weftspun-keypoint\.loop3")
+WORK.mkdir(exist_ok=True)
+
+SOURCE = r"C:\anny_test\hv_0.png"
+STYLE = "ukiyoe"
+INSTRUCTION = "keep the pose, restore photographic skin"
+```
+
+**Provenance travels with the image.** CycleGAN returns `checkpoint_sha256` with every
+result by design, and it is carried into the record below rather than dropped. A missing
+checkpoint is a 503 from that server and never a quiet fallback, so a result that arrives
+is a result from a known checkpoint.
+
+**The holdout is inherited.** Anything derived from `val2017` carries its status. The
+COCO-OOD stylized sets under `6-datasource/coco-ood-eval` are `val2017` restyled, so they
+are evaluation-only twice over: derived from the holdout, and generated. Do not point
+`SOURCE` at them.
+
+## Restyle
+
+```python
+def restyle(path, style):
+    payload = {"image": base64.b64encode(Path(path).read_bytes()).decode(),
+               "style": style, "load_size": 256}
+    response = requests.post(f"{CYCLEGAN}/predict", json=payload, timeout=300)
+    response.raise_for_status()
+    body = response.json()
+    out = WORK / f"stylized_{style}.png"
+    out.write_bytes(base64.b64decode(body["image"]))
+    return str(out), body["checkpoint_sha256"]
+
+
+STYLIZED, CHECKPOINT = restyle(SOURCE, STYLE)
+print(STYLIZED, CHECKPOINT[:16])
+```
+
+## Propose and score
+
+```python
+STEPS = [30, 40, 50]
+
+
+def propose(i):
+    out = WORK / f"round_{i}.png"
+    pixi_run("omnigen2", [
+        str(CORPUS / "omnigen2_edit.py"),
+        "--image", STYLIZED, "--out", str(out),
+        "--steps", str(STEPS[i - 1]), "--precision", "bf16",
+    ])
+    return str(out)
+
+
+def score(path):
+    out = WORK / (Path(path).stem + ".score.json")
+    pixi_run("editscore", [
+        str(HARNESS / "weft_score.py"),
+        "--source", STYLIZED, "--edited", str(path),
+        "--instruction", INSTRUCTION, "--out", str(out), "--precision", "nf4",
+    ])
+    return json.loads(out.read_text())["overall"]
+
+
+history = run(propose, score, control=STYLIZED, rounds=3)
+print(history.table())
+plot(history)
+```
+
+## Provenance
+
+```python
+record = {
+    "loop": "3-stylized-to-omnigen2",
+    "source": SOURCE,
+    "stylizer": {"service": "cyclegan-style-transfer", "style": STYLE,
+                 "checkpoint_sha256": CHECKPOINT},
+    "generator": {"model": "OmniGen2/OmniGen2", "precision": "bf16", "steps": STEPS},
+    "scorer": {"base": "Qwen/Qwen3-VL-8B-Instruct",
+               "adapter": "EditScore/EditScore-Qwen3-VL-8B-Instruct", "precision": "nf4"},
+    "scored_against": STYLIZED,
+    "baseline": history.baseline,
+    "rounds": [r.__dict__ for r in history.rounds],
+}
+(WORK / "provenance.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+print("wrote", WORK / "provenance.json")
+```
+
+A generated corpus is stored and manifested separately from constructed and real data,
+never merged into an undifferentiated pool. This record is what makes that separation
+possible later; without it the images are indistinguishable from renders.
