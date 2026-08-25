@@ -37,8 +37,15 @@ decision is not made on one number:
 
 | what the scores look like | what it means | which arm |
 | ------------------------- | ------------- | --------- |
-| low mean, low variance across views | the geometry is agreed on and the appearance is wrong | OmniGen2 on a view, then re-enter |
-| high variance across views | the views disagree about the shape | VoxHammer on the latent |
+| low mean, low spread across views | the geometry is agreed on and the appearance is wrong | OmniGen2 on a view, then re-enter |
+| high spread across views | the views disagree about the shape | VoxHammer on the latent |
+
+The threshold is a **standard deviation**, not a variance, and the first version of this
+notebook had it wrong. A score bounded in 0..1 has a variance of at most 0.25, so a
+threshold of 0.15 against variance almost never fires: four views at 0.80, 0.20, 0.75 and
+0.15 have a variance of 0.091 and would have gone to the 2D arm. `test/loop_test.exs`
+caught that before any run did. The number itself is still uncalibrated: 0.15 separates two
+scripted cases and nothing has compared it to real EditScore output.
 
 That is the whole reason the views come from `sphere_hammersley_sequence` rather than from
 a front view somebody picked. One view cannot separate these two cases, and a hand-picked
@@ -74,7 +81,7 @@ WORK.mkdir(exist_ok=True)
 SOURCE = r"C:\anny_test\hv_0.png"
 INSTRUCTION = "a textured mesh matching the figure in the source image"
 NVIEWS = 8
-VARIANCE_SELECTS_LATENT = 0.15
+SPREAD_SELECTS_LATENT = 0.15  # standard deviation, not variance: see below
 ```
 
 ## Propose: a latent and its views
@@ -116,14 +123,14 @@ def score_all(views):
     scores = [score_view(v) for v in views]
     return {"scores": scores,
             "mean": statistics.fmean(scores),
-            "variance": statistics.pvariance(scores)}
+            "spread": statistics.pstdev(scores)}
 ```
 
 ## The router
 
 ```python
 def choose_arm(summary):
-    if summary["variance"] >= VARIANCE_SELECTS_LATENT:
+    if summary["spread"] >= SPREAD_SELECTS_LATENT:
         return "voxhammer", "the views disagree about the shape"
     return "omnigen2", "the views agree and the appearance is wrong"
 
@@ -160,7 +167,7 @@ state, views = generate(SOURCE)
 summary = score_all(views)
 arm, why = choose_arm(summary)
 
-print(f"mean {summary['mean']:.3f}  variance {summary['variance']:.4f}")
+print(f"mean {summary['mean']:.3f}  spread {summary['spread']:.4f}")
 print(f"router selects {arm}: {why}")
 for i, s in enumerate(summary["scores"]):
     print(f"  view {i}  {s:.3f}")
@@ -174,7 +181,7 @@ else:
     repaired = repair_omnigen2(views[worst], worst)
     state, views = generate(repaired)
     summary = score_all(views)
-    print(f"after repair: mean {summary['mean']:.3f}  variance {summary['variance']:.4f}")
+    print(f"after repair: mean {summary['mean']:.3f}  spread {summary['spread']:.4f}")
 ```
 
 ## Extract, once the score earns it
@@ -209,7 +216,7 @@ record = {
                "adapter": "EditScore/EditScore-Qwen3-VL-8B-Instruct", "precision": "nf4"},
     "view_scores": summary["scores"],
     "mean": summary["mean"],
-    "variance": summary["variance"],
+    "spread": summary["spread"],
     "arm": arm,
     "arm_reason": why,
     "voxhammer_state": "stub, edit steps not wired",
