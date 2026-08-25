@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -166,3 +167,28 @@ def plot(history: History):
     ax.legend()
     fig.tight_layout()
     return fig
+
+
+def require_whole_sequence(indices, n_views, band=None):
+    """Every view of the sequence, or a declared band. Never a hand-picked set or a prefix.
+
+    `check_view_selection.check` in the corpus repository is the implementation and this is
+    the gate: that function returns problems and `gen_posed_from_reference.py` prints them,
+    which is a warning nobody has to obey. Here they raise.
+
+    The measurement behind the rule is in that file's docstring. At n=8 the sequence's
+    pitches are -90, -30, 0, 9.6, 19.5, 30, 41.8 and 56.4 degrees, so they are not uniform:
+    dropping index 0 alone removes the only view below -30, and any subset silently changes
+    the pitch distribution the corpus is trained on. A prefix is the polite version of the
+    same defect, which is why it is refused here rather than reported.
+    """
+    if str(CORPUS) not in sys.path:
+        sys.path.insert(0, str(CORPUS))
+    import check_view_selection
+
+    problems = check_view_selection.check(list(indices), int(n_views), band=band)
+    if problems:
+        raise PreconditionFailed(
+            "the view selection is not the whole sequence: " + "; ".join(problems)
+        )
+    return True
