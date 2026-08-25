@@ -73,10 +73,22 @@ def to_17(names, array):
 ## Inputs
 
 ```python
-PHOTO = r"C:\anny_test\reference.png"
+PHOTO = r"C:\anny_test\hv_0.png"
 WORK = Path(r"C:\weftspun-keypoint\.loop1")
 WORK.mkdir(exist_ok=True)
 ```
+
+`hv_0.png` is an ANNY render standing in for a photograph so that the path resolves. It is
+not a photograph, and a render scored against itself measures the renderer rather than the
+fit, so point `PHOTO` at a real image before reading anything into the number.
+
+`hv_0.png` is an ANNY render standing in for a photograph so that the path resolves. It is
+not a photograph, and a render scored against itself measures the renderer rather than the
+fit, so point `PHOTO` at a real image before reading anything into the number.
+
+`hv_0.png` is an ANNY render standing in for a photograph, so that the path resolves. It is
+not a photograph, and a render scored against itself measures the renderer rather than the
+fit, so point `PHOTO` at a real image before reading anything into the number.
 
 Do not point `PHOTO` at `coco_person_commercial_val2017`. That set is the blinded
 holdout: not inspected while developing, not used to pick a checkpoint, a threshold or a
