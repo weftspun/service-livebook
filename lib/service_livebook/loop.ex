@@ -16,9 +16,15 @@ defmodule ServiceLivebook.Loop do
   * `{:unavailable, why}` from a proposer records that a stage was selected and could not
     run. Loop 4's latent arm answers this, and substituting the other arm would record a
     geometry failure as an appearance failure that was repaired.
+  * `{:ok, n}` where `n` is off the scale `ServiceLivebook.Stage` declares is not a
+    measurement either. It is a stage returning a number of the wrong shape -- a 0..1
+    score, a percentage, a logit -- and recording it would put the router back where it
+    has already been twice.
   * A baseline that cannot be measured stops the run. A score with nothing to compare it
     against is not a measurement of anything.
   """
+
+  alias ServiceLivebook.Stage
 
   defmodule Round do
     @moduledoc "One round: what it produced, what that scored, and how far above the floor."
@@ -29,7 +35,7 @@ defmodule ServiceLivebook.Loop do
             artifact: String.t() | nil,
             score: float() | nil,
             delta: float() | nil,
-            outcome: :scored | :refused | :unavailable,
+            outcome: :scored | :refused | :unavailable | :off_scale,
             detail: String.t() | nil
           }
   end
@@ -67,8 +73,12 @@ defmodule ServiceLivebook.Loop do
 
     case stage.score(control, input) do
       {:ok, baseline} ->
-        history = %History{baseline: baseline, control: control}
-        {:ok, take(stage, input, 1, rounds, target, history)}
+        if Stage.on_scale?(baseline) do
+          history = %History{baseline: baseline, control: control}
+          {:ok, take(stage, input, 1, rounds, target, history)}
+        else
+          {:error, {:baseline_off_scale, baseline, Stage.scale()}}
+        end
 
       {:refused, why} ->
         {:error, {:baseline_refused, why}}
@@ -95,13 +105,24 @@ defmodule ServiceLivebook.Loop do
       {:ok, artifact} ->
         case stage.score(artifact, input) do
           {:ok, score} ->
-            %Round{
-              index: index,
-              artifact: artifact,
-              score: score,
-              delta: score - baseline,
-              outcome: :scored
-            }
+            if Stage.on_scale?(score) do
+              %Round{
+                index: index,
+                artifact: artifact,
+                score: score,
+                delta: score - baseline,
+                outcome: :scored
+              }
+            else
+              {low, high} = Stage.scale()
+
+              %Round{
+                index: index,
+                artifact: artifact,
+                outcome: :off_scale,
+                detail: "scored #{inspect(score)}, and the scale is #{low}..#{high}"
+              }
+            end
 
           {:refused, why} ->
             %Round{index: index, artifact: artifact, outcome: :refused, detail: why}
@@ -131,15 +152,30 @@ defmodule ServiceLivebook.Loop do
   failure. A single hand-picked front view cannot separate the two, which is why the views
   come from the camera sequence.
 
-  THE THRESHOLD IS A SPREAD IN SCORE UNITS, NOT A VARIANCE, and the correction is worth
-  keeping. The first version compared variance against 0.15. A score bounded in 0..1 has a
-  variance of at most 0.25, reached only when half the views score 0 and half score 1, so
-  that threshold fired almost never: four views at 0.80, 0.20, 0.75 and 0.15, about as
-  disagreeing as views realistically get, have a variance of 0.091 and would have been
-  routed to the 2D arm. A unit test caught it before any run did.
+  THE STATISTIC IS SPREAD OVER MEAN, AND BOTH EARLIER FORMS ARE RETRACTED. They are kept
+  here because a reader who knows which roads are dead ends is better off than one who only
+  knows the current answer.
 
-  The number itself is still unmeasured. 0.15 of standard deviation separates the two
-  scripted cases, and nothing has calibrated it against real EditScore output.
+  The first compared a VARIANCE against 0.15. A score believed to be bounded in 0..1 has a
+  variance of at most 0.25, reached only when half the views score 0 and half score 1, so
+  the threshold fired almost never: four views at 0.80, 0.20, 0.75 and 0.15, about as
+  disagreeing as views realistically get, have a variance of 0.091 and were routed to the
+  2D arm. A unit test caught it before any run did.
+
+  The second compared a STANDARD DEVIATION against the same 0.15, which was right about the
+  units and wrong about the range. The scale is 0..10, measured, so the same four views
+  scaled to what EditScore actually returns -- 8.0, 2.0, 7.5, 1.5 -- have a standard
+  deviation of 3.01, and so does almost anything else. The threshold that almost never
+  fired now fires on almost everything.
+
+  A constant compared against an assumed range is the defect, not the constant. Spread over
+  mean is dimensionless, so the same threshold reads the same on either scale, and
+  `route/2` returns the same arm for a set of scores and for that set times ten. That is a
+  test rather than a claim.
+
+  The number itself is still unmeasured. 0.15 separates the two scripted cases and nothing
+  has calibrated it against real EditScore output, which is what
+  `fourloops-plan.usda`'s `routerCalibrated = 0` records.
   """
   @spec route([float()], float()) :: {:latent | :view, String.t()}
   def route(view_scores, spread_threshold \\ 0.15)
@@ -147,14 +183,37 @@ defmodule ServiceLivebook.Loop do
   def route([], _threshold), do: {:view, "no views were scored, so nothing disagrees yet"}
 
   def route(view_scores, threshold) do
-    if :math.sqrt(variance(view_scores)) >= threshold do
-      {:latent, "the views disagree about the shape"}
-    else
-      {:view, "the views agree and the appearance is wrong"}
+    case spread_over_mean(view_scores) do
+      :undefined ->
+        {:view, "every view scored zero, so there is no spread to read"}
+
+      spread when spread >= threshold ->
+        {:latent, "the views disagree about the shape"}
+
+      _ ->
+        {:view, "the views agree and the appearance is wrong"}
     end
   end
 
-  @doc "Population variance, the quantity `route/2` decides on."
+  @doc """
+  Standard deviation over mean, the quantity `route/2` decides on.
+
+  `:undefined` when the mean is zero, which is every view scoring zero. That is not
+  agreement about a good shape and not disagreement either -- it is a generation nothing
+  liked, and dividing by it would report `NaN` or crash depending on the runtime.
+  """
+  @spec spread_over_mean([float()]) :: float() | :undefined
+  def spread_over_mean(scores) do
+    mean = Enum.sum(scores) / length(scores)
+
+    if mean == 0 do
+      :undefined
+    else
+      :math.sqrt(variance(scores)) / abs(mean)
+    end
+  end
+
+  @doc "Population variance, which `spread_over_mean/1` divides."
   def variance(scores) do
     mean = Enum.sum(scores) / length(scores)
     Enum.sum(Enum.map(scores, &((&1 - mean) * (&1 - mean)))) / length(scores)
