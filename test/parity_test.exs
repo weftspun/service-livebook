@@ -18,7 +18,7 @@ defmodule ServiceLivebook.ParityTest do
 
   alias ServiceLivebook.Loop
 
-  @script [0.30, 0.52, 0.61, 0.66]
+  @script [3.0, 5.2, 6.1, 6.6]
 
   defmodule ScriptedStage do
     @moduledoc "The same script the Python side is given: control first, then each round."

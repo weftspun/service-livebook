@@ -1,0 +1,46 @@
+# The unit tests run here and the models do not. Every stage in the suite is a Mox mock of
+# `ServiceLivebook.Stage`, so what CI exercises is the loop -- the baseline, the deltas,
+# the early stop, and the four answers a stage can give -- with no card, no pixi
+# environment and no seventeen gigabytes of weights. What the models do is measured on the
+# desk and written down in the logbook; this job would only be pretending.
+name: Checks
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+      - run: mix deps.get
+      - run: mix test
+
+  no-exceptions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+      # `mix deps.get` because the gate parses with Sourceror, which is a dependency. It
+      # ran standalone while it used `Code.string_to_quoted/2`; what the dependency buys is
+      # the range of the offending clause, and a path to fixing violations rather than
+      # reporting them.
+      - run: mix deps.get
+      # The controls first. A gate that cannot fail certifies the defect, and this one has
+      # been wrong twice: it missed `def ... rescue`, which is how the construct is usually
+      # written, and then the move to Sourceror turned that same check off again, because
+      # Sourceror wraps keyword keys in `__block__` nodes and the key match stopped matching.
+      - run: mix run --no-start scripts/check_no_exceptions.exs --self-test
+      - run: mix run --no-start scripts/check_no_exceptions.exs
