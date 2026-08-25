@@ -71,7 +71,8 @@ from pathlib import Path
 HARNESS = Path(r"C:\weftspun-keypoint\7-service\service-livebook\priv\python")
 CORPUS = Path(r"C:\weftspun-keypoint\6-datasource\anny-render-corpus")
 sys.path.insert(0, str(HARNESS))
-from weft_loop import run, pixi_run, plot, PreconditionFailed
+from weft_loop import History, Round, pixi_run, plot, PreconditionFailed
+from loop4 import extract, region, repair_latent, require_voxhammer
 
 PIXAL3D = "http://localhost:8002"
 VOXHAMMER = "http://localhost:8003"
@@ -126,28 +127,13 @@ def score_all(views):
             "spread": statistics.pstdev(scores)}
 ```
 
-## The router
+## The router, and the two arms
 
 ```python
 def choose_arm(summary):
     if summary["spread"] >= SPREAD_SELECTS_LATENT:
         return "voxhammer", "the views disagree about the shape"
     return "omnigen2", "the views agree and the appearance is wrong"
-
-
-def repair_voxhammer(state_b64, region_b64, seed=42):
-    payload = {"mesh": state_b64, "reference":
-               base64.b64encode(Path(SOURCE).read_bytes()).decode(),
-               "region": region_b64, "seed": seed}
-    response = requests.post(f"{VOXHAMMER}/predict", json=payload, timeout=1800)
-    if response.status_code == 500:
-        raise PreconditionFailed(
-            "VoxHammer's edit steps are not wired up. The router selected the latent arm, "
-            "and it cannot run. This is reported rather than swapped for the 2D arm, "
-            "because that swap would make a geometry failure look repaired."
-        )
-    response.raise_for_status()
-    return response.json()
 
 
 def repair_omnigen2(view_path, i):
@@ -160,42 +146,54 @@ def repair_omnigen2(view_path, i):
     return str(out)
 ```
 
-## Run it
+The latent arm is `loop4.repair_latent`, and it does three things in the order the services
+require: ask `/health`, call Pixal3D's `/extract` because VoxHammer takes a mesh rather
+than the latent, and only then edit. Each of those was wrong here before
+`priv/python/test_loop4.py` was written: the mask was a name that did not exist, the latent
+was handed straight to the editor, and unavailability was read from an HTTP 500 when a
+stubbed VoxHammer answers 200 with `stub: true` after marking all seven plan steps done
+without editing anything.
+
+## Run it, with a floor to compare against
 
 ```python
+baseline = score_view(SOURCE)
+history = History(baseline=baseline, control=SOURCE)
 state, views = generate(SOURCE)
-summary = score_all(views)
-arm, why = choose_arm(summary)
 
-print(f"mean {summary['mean']:.3f}  spread {summary['spread']:.4f}")
-print(f"router selects {arm}: {why}")
-for i, s in enumerate(summary["scores"]):
-    print(f"  view {i}  {s:.3f}")
-```
-
-```python
-if arm == "voxhammer":
-    result = repair_voxhammer(state, region_b64)
-else:
-    worst = summary["scores"].index(min(summary["scores"]))
-    repaired = repair_omnigen2(views[worst], worst)
-    state, views = generate(repaired)
+for i in (1, 2):
     summary = score_all(views)
-    print(f"after repair: mean {summary['mean']:.3f}  spread {summary['spread']:.4f}")
+    arm, why = choose_arm(summary)
+    print(f"round {i}: mean {summary['mean']:.3f}  spread {summary['spread']:.4f}  -> {arm} ({why})")
+    history.rounds.append(Round(index=i, artifact=str(WORK / f"round_{i}"),
+                                score=summary["mean"], delta=summary["mean"] - baseline,
+                                seconds=0.0,
+                                provenance={"scores": summary["scores"], "arm": arm}))
+    if i == 2:
+        break
+    if arm == "voxhammer":
+        repair_latent(VOXHAMMER, PIXAL3D, state, SOURCE, WORK, mask=None)
+    else:
+        worst = summary["scores"].index(min(summary["scores"]))
+        state, views = generate(repair_omnigen2(views[worst], worst))
+
+print(history.table())
 ```
+
+The baseline is the source scored against itself, because a number without one is not a
+measurement, and loop 4 had no floor at all until now.
+
+`repair_latent` raises rather than returning. Today it raises at `/health`, because
+VoxHammer is stubbed. When that is wired it will raise one step later, at the point where a
+returned USD layer has no path back to the `.npz` that `render_view.py` renders. Both are
+recorded as an unavailable round rather than being swapped for the 2D arm, because that
+swap would file a geometry failure as an appearance failure that was repaired.
 
 ## Extract, once the score earns it
 
 ```python
-def extract(state_b64, decimation_target=20000, texture_size=2048):
-    response = requests.post(f"{PIXAL3D}/extract", json={
-        "state": state_b64, "decimation_target": decimation_target,
-        "texture_size": texture_size}, timeout=1800)
-    response.raise_for_status()
-    body = response.json()
-    (WORK / "mesh.glb").write_bytes(base64.b64decode(body["glb"]))
-    (WORK / "mesh.usda").write_bytes(base64.b64decode(body["layer"]))
-    return WORK / "mesh.glb", WORK / "mesh.usda"
+glb, layer = extract(PIXAL3D, state, WORK)
+print(glb, layer)
 ```
 
 The USD layer names the GLB as an asset path rather than referencing it, and the GLB
@@ -219,6 +217,7 @@ record = {
     "spread": summary["spread"],
     "arm": arm,
     "arm_reason": why,
+    "region": "whole object; there is no segmentation step in this loop yet",
     "voxhammer_state": "stub, edit steps not wired",
 }
 (WORK / "provenance.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
