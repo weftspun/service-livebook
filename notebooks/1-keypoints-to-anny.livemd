@@ -1,0 +1,175 @@
+<!-- livebook:{"default_language":"python"} -->
+
+# Loop 1: RF-DETR keypoints, ANNY, EditScore
+
+```elixir
+Mix.install([
+  {:pythonx, "~> 0.4.9"},
+  {:kino_pythonx, "~> 0.1.0"},
+  {:kino, "~> 0.19.0"}
+])
+```
+
+```pyproject.toml
+[project]
+name = "weft_loop_notebook"
+version = "0.0.0"
+requires-python = "==3.11.*"
+dependencies = [
+  "pillow==11.1.0",
+  "numpy==2.2.3",
+  "matplotlib==3.10.1"
+]
+```
+
+## What this loop is
+
+A photograph goes in. RF-DETR reads keypoints out of it, ANNY is fitted to those
+keypoints, the fitted rig is rendered, and the render is scored against the photograph.
+The referee is a second opinion answering a question EditScore cannot: whether a body
+could hold that pose at all.
+
+Nothing in this notebook runs until you run it. Every cell that touches the card is a
+subprocess into a pixi environment, so reading the notebook costs nothing.
+
+## Two facts that will bite before anything else does
+
+**RF-DETR gives 17 joints and ANNY's `coco.pth` gives 23.** The extra six are foot
+points. Comparing the two arrays directly compares different things, so the subset is
+taken explicitly and named, not sliced silently.
+
+**`render_corpus.py` requires the 19,158-vertex makehuman topology** with
+`remove_unattached_vertices=False`. The 13,718-vertex body submodel that `anny_rig.py`
+builds for the corpus is a different width, and `coco.pth` is indexed against the first.
+One direction fails loudly. The other does not, which is the dangerous one.
+
+```python
+import sys, json
+from pathlib import Path
+
+HARNESS = Path(r"C:\weftspun-keypoint\7-service\service-livebook\priv\python")
+CORPUS = Path(r"C:\weftspun-keypoint\6-datasource\anny-render-corpus")
+CONSENSUS = Path(r"C:\weftspun-keypoint\3-interactor\pose-consensus\python")
+sys.path.insert(0, str(HARNESS))
+sys.path.insert(0, str(CONSENSUS))
+
+from weft_loop import run, pixi_run, plot, household
+
+COCO17 = ["nose", "left_eye", "right_eye", "left_ear", "right_ear",
+          "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+          "left_wrist", "right_wrist", "left_hip", "right_hip",
+          "left_knee", "right_knee", "left_ankle", "right_ankle"]
+
+
+def to_17(names, array):
+    """The explicit subset. A missing name is an error, not a shorter array."""
+    index = {n: i for i, n in enumerate(names)}
+    missing = [n for n in COCO17 if n not in index]
+    if missing:
+        raise KeyError(f"the render asset is missing {missing}")
+    return array[[index[n] for n in COCO17]]
+```
+
+## Inputs
+
+```python
+PHOTO = r"C:\anny_test\reference.png"
+WORK = Path(r"C:\weftspun-keypoint\.loop1")
+WORK.mkdir(exist_ok=True)
+```
+
+Do not point `PHOTO` at `coco_person_commercial_val2017`. That set is the blinded
+holdout: not inspected while developing, not used to pick a checkpoint, a threshold or a
+stopping point, and not looked at to decide whether this loop is working. A holdout
+consulted during development has been trained on by hand, just slowly.
+
+## Detect
+
+```python
+def detect(path):
+    result = pixi_run("corpus", [
+        str(Path(r"C:\weftspun-keypoint\1-transport\rf-detr-mcp") / "test_keypoints.py"),
+        str(path),
+    ])
+    return result.stdout
+```
+
+RF-DETR runs on CPU here by design, so this step does not compete with the renderer or
+the scorer for the card.
+
+## Fit, render, score
+
+```python
+def propose(i):
+    render = WORK / f"fit_{i}.png"
+    pixi_run("anny", [
+        str(CORPUS / "render_view.py"),
+        str(WORK / f"fit_{i}.npz"), str(render),
+        "--index", str(i - 1), "--views", "8",
+        "--variant", "llvm_ad_rgb", "--threads", "1",
+    ])
+    return str(render)
+
+
+def score(path):
+    out = WORK / (Path(path).stem + ".score.json")
+    pixi_run("editscore", [
+        str(HARNESS / "weft_score.py"),
+        "--source", PHOTO, "--edited", str(path),
+        "--instruction", "match the pose of the person in the source photograph",
+        "--out", str(out), "--precision", "nf4",
+    ])
+    return json.loads(out.read_text())["overall"]
+```
+
+`--variant llvm_ad_rgb --threads 1` is the reproducible renderer. `metal_ad_rgb` is 60
+times faster and is not bit-reproducible, so it produces nothing a later round can be
+compared against.
+
+The view index walks the `sphere_hammersley_sequence`. A front view picked by hand shows
+error of five stacked soda cans along the travel axis against three and a half across it,
+which is a measurement of the view rather than of the fit.
+
+## The referee, which is not the score
+
+```python
+from soma_referee import referee
+
+verdict = referee(fit_residuals, stature)
+print(verdict.call)
+for region, pct in verdict.residual_pct.items():
+    print(f"  {region:>10}  {pct:5.2f}% of stature  {verdict.household(region)}")
+```
+
+`FITS`, `IMPOSSIBLE`, `HANDS_UNTRUSTED` or `NOT_RUN`. A missing region is `NOT_RUN` and
+never a pass, which is the rule the harness applies to a missing environment as well. The
+referee already reports each residual as a household object, so nothing here reformats it.
+
+`fit_residuals` and `stature` come from the `AnnyInverter` solve. That solve is the one
+piece of this loop with no CLI, so it runs in a cell of its own above this one.
+
+## Run it
+
+```python
+history = run(propose, score, control=PHOTO, rounds=3)
+print(history.table())
+plot(history)
+```
+
+## Provenance
+
+```python
+record = {
+    "loop": "1-keypoints-to-anny",
+    "photo": PHOTO,
+    "detector": {"model": "RFDETRKeypointPreview", "joints": 17},
+    "rig": {"topology": "makehuman", "vertices": 19158, "keypoint_asset_points": 23},
+    "renderer": {"engine": "mitsuba", "variant": "llvm_ad_rgb", "threads": 1,
+                 "cameras": "sphere_hammersley_sequence"},
+    "referee": {"call": str(verdict.call), "residual_pct": verdict.residual_pct},
+    "baseline": history.baseline,
+    "rounds": [r.__dict__ for r in history.rounds],
+}
+(WORK / "provenance.json").write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+print("wrote", WORK / "provenance.json")
+```

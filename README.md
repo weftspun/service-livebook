@@ -35,3 +35,33 @@ be raised here without an override that contradicts the pin:
 `mix hex.audit` reproduces the list. This is recorded rather than silently
 accepted: the server binds to loopback by default, and the two HIGH entries are
 denial of service against a listening endpoint rather than data exposure.
+
+## Two ways to run it, and one that is closed
+
+    mix run --no-halt -e 'IO.puts ServiceLivebook.start()'   # on the desk, GPU reachable
+    docker run -p 8080:8080 weftspun/service-livebook:dev    # container
+    sh scripts/run-bwrap.sh                                  # same image, bubblewrap, Linux only
+
+The container and the sandbox run the same artifact: `scripts/run-bwrap.sh`
+exports the image's root filesystem once and points bubblewrap at it, so a
+difference between the two is a difference in the sandbox and not in the build.
+Both were checked by asking `/public/health` for a 200 rather than by watching
+the log say it started.
+
+**A Windows service is closed, and this records why rather than leaving it to be
+found again.** A Mix release installs one through `erlsrv`, and its `install`
+command refuses to run unless `RELEASE_DISTRIBUTION` names a node. Livebook
+starts distribution itself, with longnames and its own EPMD module, so a release
+that has already started a node makes `Livebook.Application.start_distribution!`
+abort with `{:already_started, _}`. That is the measured failure, not a
+prediction: the first container did exactly this until `rel/env.sh.eex` set
+`RELEASE_DISTRIBUTION=none`. The two settings cannot both hold, so the service
+route needs a supervisor that runs the release as a plain foreground process,
+such as NSSM, rather than `erlsrv`.
+
+## GPU
+
+The container can reach the card (`docker run --gpus all`, verified), but the
+notebooks reach their models through the `pixi` environments in
+`6-datasource/anny-render-corpus`, which are on the desk. Until that repository
+is bind-mounted, the GPU notebooks run under the first command above.
