@@ -34,7 +34,22 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 NOTEBOOKS = HERE.parent.parent / "notebooks"
 ROOT = Path(r"C:\weftspun-keypoint")
-DOCS = [ROOT / "fourloops.md", ROOT / "fourloops-etnf.html"]
+MANIFEST = ROOT / ".repo" / "manifests" / "default.xml"
+
+
+def root_documents(manifest: Path = MANIFEST, root: Path = ROOT):
+    """The root documents, read from the manifest rather than listed here.
+
+    Every file at the workspace root is a `<linkfile>`, so the manifest already says which
+    documents exist and a second list here is a second place the fact lives. It drifted
+    exactly that way: this file named `fourloops-etnf.html` while the manifest had moved to
+    `fourloops-etnf.usda`, and the checker reported a broken link that was its own.
+    """
+    if not manifest.is_file():
+        return []
+    text = manifest.read_text(encoding="utf-8", errors="ignore")
+    names = re.findall(r'<linkfile[^>]*dest="([^"]+)"', text)
+    return [root / n for n in names if Path(n).suffix in {".md", ".html", ".usda"}]
 
 CELL_RE = re.compile(r"```python\n(.*?)```", re.S)
 ABS_PATH_RE = re.compile(r"""[rR]?['"]([A-Za-z]:[\\/][^'"]*)['"]""")
@@ -126,7 +141,7 @@ def check(notebooks=NOTEBOOKS, docs=None):
         source = path.read_text(encoding="utf-8")
         check_paths(path.name, source, problems, unchecked)
         check_routes(path.name, source, problems)
-    for doc in (DOCS if docs is None else docs):
+    for doc in (root_documents() if docs is None else docs):
         check_document(Path(doc), problems, unchecked)
     return problems, unchecked
 

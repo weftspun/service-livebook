@@ -55,7 +55,7 @@ CONSENSUS = Path(r"C:\weftspun-keypoint\3-interactor\pose-consensus\python")
 sys.path.insert(0, str(HARNESS))
 sys.path.insert(0, str(CONSENSUS))
 
-from weft_loop import run, pixi_run, plot, household, PreconditionFailed
+from weft_loop import run, pixi_run, plot, household, PreconditionFailed, require_whole_sequence
 ```
 
 ## Inputs
@@ -92,15 +92,30 @@ the scorer for the card.
 ## Fit, render, score
 
 ```python
+VIEWS = 8
+
+
 def propose(i):
-    render = WORK / f"fit_{i}.png"
-    pixi_run("anny", [
-        str(CORPUS / "render_view.py"),
-        str(WORK / f"fit_{i}.npz"), str(render),
-        "--index", str(i - 1), "--views", "8",
-        "--variant", "llvm_ad_rgb", "--threads", "1",
-    ])
-    return str(render)
+    """Render the whole sequence, never one index of it.
+
+    An earlier version rendered index i-1 on round i, so three rounds produced views 0, 1
+    and 2 -- a prefix, which `check_view_selection` reports as a defect for a measured
+    reason. At n=8 the sequence's pitches are -90, -30, 0, 9.6, 19.5, 30, 41.8 and 56.4
+    degrees, so dropping index 0 removes the only view below -30 and any subset silently
+    changes the pitch distribution. `require_whole_sequence` raises rather than warning.
+    """
+    require_whole_sequence(range(VIEWS), VIEWS)
+    rendered = []
+    for view in range(VIEWS):
+        out = WORK / f"fit_{i}_view{view}.png"
+        pixi_run("anny", [
+            str(CORPUS / "render_view.py"),
+            str(WORK / f"fit_{i}.npz"), str(out),
+            "--index", str(view), "--views", str(VIEWS),
+            "--variant", "llvm_ad_rgb", "--threads", "1",
+        ])
+        rendered.append(str(out))
+    return rendered[0]
 
 
 def score(path):
@@ -118,9 +133,11 @@ def score(path):
 times faster and is not bit-reproducible, so it produces nothing a later round can be
 compared against.
 
-The view index walks the `sphere_hammersley_sequence`. A front view picked by hand shows
-error of five stacked soda cans along the travel axis against three and a half across it,
-which is a measurement of the view rather than of the fit.
+The views are the whole `sphere_hammersley_sequence`, all eight, every round. A front view
+picked by hand shows error of five stacked soda cans along the travel axis against three and
+a half across it, which is a measurement of the view rather than of the fit -- and picking a
+member of the sequence is that same failure one level down, since the sequence is not uniform
+in pitch.
 
 ## The fit, which does exist
 
